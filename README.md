@@ -344,9 +344,20 @@ with `python -m applypilot runlog --json`:
 | Mean wall time per job | 3.6 s (CLI-reported API time 2.2 s) |
 
 This is API-equivalent spend as priced by the CLI; on a subscription plan it is drawn
-from the plan's usage allowance rather than billed per call. The hundred-a-day
-arithmetic is finished in Milestone 7 below, once the trials give a number from more
-than one session.
+from the plan's usage allowance rather than billed per call.
+
+Across the six ten-job trial sessions (three before the improvement, three after), the
+per-trial mean cost was $0.00265, $0.00263, $0.00260, $0.00266, $0.00261, $0.00268, so the number I
+am using is **$0.00264 per scored job**, at **3.5 s** of wall time each.
+
+A hundred people a day: if "one run" is one person scoring one job, that is
+100 x $0.00264 = **$0.264 per day**, or about $96 a year. That is not the
+realistic shape of use, though. A person runs the stage on their whole pending queue;
+mine has 82 unscored jobs right now. A hundred people each scoring 82 jobs is
+100 x 82 x $0.00264 = **$21.63 per day** (about $649 a month), and
+100 x 82 x 3.5 s = 8.1 hours of scoring time per day, which a single
+serial process cannot do in a day. The money is small; the time is the constraint, and
+the run log is where I would measure a parallel scorer against it.
 
 **Run Log and Verdicts**
 
@@ -514,3 +525,69 @@ and the matching `job_scored` record from that trial, unchanged in shape:
 ```
 {"ts": "2026-11-13T20:57:51.383+00:00", "run_id": "0debe35a", "event": "job_scored", "stage": "score", "job_url": "https://www.linkedin.com/jobs/view/4469784755", "job_title": "Junior Actuarial Analyst", "status": "error", "score": 0, "parse_ok": false, "duration_ms": 1395, "error": "TimeoutExpired: Command '['C:\\\\Users\\\\caomi\\\\.local\\\\bin\\\\claude.EXE', '-p', '--model', 'haiku', '--tools', '', '--output-format', 'json', '--no-session-persistence', '--disable-slash-commands', '--strict-mcp-config', '--system-prompt', \"You are a job fit evaluator. Given a candidate's resume and a job description,"}
 ```
+
+**What's Still Broken**
+
+*Criterion 2 is still missed* (10 of 20 records complete in every normal trial,
+5 of 10 in every failure trial): every `job_scored` record lacks `model`. What I would do: in
+`score_job()`, call `get_client()` before opening the telemetry context and pass
+`model=client.model` into it, so both records carry the model. It is one line and I
+tested the idea in my head, not in code. I stopped because the unit allows one measured
+improvement and criterion 4 was the one that loses applications; a second improvement is
+the first thing on the stretch list and I did not have the time left to run six more
+trials for it.
+
+*The improvement created a trade-off I have not closed.* A job whose call fails now
+stays pending forever. There is no `score_attempts` column (tailoring has one, scoring
+does not), so a job that fails every time, say because its description is malformed in
+a way that makes the CLI reject the prompt, will be retried on every run and cost one
+call each time. What I would do: add `score_attempts`, increment it on error, and let
+`pending_score` exclude jobs with five or more, which is exactly how `tailor_attempts`
+already works. I stopped because that is a second mechanism, and the run log would tell
+me within a day whether the loop actually happens (a `job_url` recurring across
+`run_id`s with `status = error`).
+
+*The error text is noisy.* The `error` field on a timeout is the whole `subprocess`
+command line, including the first 300 characters of the system prompt, because
+`TimeoutExpired`'s message is the command. The exception type at the front satisfied the
+criterion, but it is not the record I would want to read at 2 a.m. The fix is to format
+the error from the exception type and the timeout value in `_chat_claude_code`, not from
+`str(e)`.
+
+*If this were real and I had another unit,* the one thing I would do first is the
+`score_attempts` cap, because the improvement I shipped is only safe with it: it turned
+"a failed job is silently lost" into "a failed job is retried without limit", and the
+second one is a cost bug waiting for a bad job description. Everything else on this list
+is a logging nicety by comparison.
+
+*Targets I would tighten.* Criterion 5 (9 of 10 under 6 s) never came close to failing;
+the slowest call in six trials was 5425 ms. The honest target is "10 of 10 under
+5 s", which the data would still have met, and which would start to bite the moment the
+CLI got slower.
+
+**How I Used AI**
+
+I ran this unit inside Claude Code, with the capstone brief pasted in as the starting
+prompt, and let it drive the build while I reviewed each commit. Two moments that
+changed what ended up in the repository:
+
+1. *Pinning.* I asked it to test RUNNING.md from a clean clone into a fresh virtual
+   environment. It came back saying the run worked first time but the fresh environment
+   had resolved to different versions than the ones I had written down from my working
+   machine (rich 15.0.0 vs 14.3.3, typer 0.29.1 vs 0.24.1, pandas 3.1.1 vs 2.2.3). I had
+   been about to call that "tested". What I changed: `requirements-capstone.txt` now
+   holds the versions that actually ran in the clean environment, and RUNNING.md says
+   so.
+
+2. *The overwritten trials.* After the first pass of trials, the script that assembles
+   the pasted output failed because `trial-before-timeout-1.jsonl` did not exist. The
+   failure trials had been written to the same file names as the normal trials and had
+   overwritten them. The summary numbers survived in a separate file, so I could have
+   pasted those and moved on. What I changed: fixed the naming in
+   `scripts/capstone_trial.py`, deleted the first pass, and re-ran both before-sets with
+   the system still unchanged, so that every pasted record in this README comes from a
+   file that still exists. The verdicts were identical both times.
+
+The acceptance criteria were drafted inside the same session and I edited them before
+committing; the targets are the ones I am prepared to defend above, and the misses were
+real.
