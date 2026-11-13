@@ -61,8 +61,9 @@ def run_trial(home: Path, k: int, jobs: int, label: str, fail_mode: str | None,
 
     log_dir = home / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    run_log = log_dir / f"trial-{label}-{k}.jsonl"
-    out_file = log_dir / f"trial-{label}-{k}.out.txt"
+    tag = f"{label}-{fail_mode}" if fail_mode else label
+    run_log = log_dir / f"trial-{tag}-{k}.jsonl"
+    out_file = log_dir / f"trial-{tag}-{k}.out.txt"
     if run_log.exists():
         run_log.unlink()
 

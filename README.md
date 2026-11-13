@@ -347,3 +347,110 @@ This is API-equivalent spend as priced by the CLI; on a subscription plan it is 
 from the plan's usage allowance rather than billed per call. The hundred-a-day
 arithmetic is finished in Milestone 7 below, once the trials give a number from more
 than one session.
+
+**Run Log and Verdicts**
+
+Three trials per criterion, nothing changed between them. Normal trials score the same
+ten jobs (`--rescore` against a restored database copy); failure trials score five
+unscored jobs with `LLM_TIMEOUT=0.2`. All numbers below are read from the trial runner's
+output (`run_trial()` in `scripts/capstone_trial.py`), which reads the run log written by
+`telemetry.record()` and, for criterion 4, queries the database copy afterwards.
+
+| Criterion | Target | Run 1 | Run 2 | Run 3 | Verdict |
+|---|---|---|---|---|---|
+| 1. Every scored job leaves exactly one `llm_call` and one `job_scored` record | 10+10 of 10+10, 0 malformed | 10+10 | 10+10 | 10+10 | MET |
+| 2. Every record has the required fields | 20 of 20 (normal), 10 of 10 (failure) | 10/20, 5/10 | 10/20, 5/10 | 10/20, 5/10 | MISSED |
+| 3. Provider failure: stage finishes, every failure recorded with its exception type | 5 of 5, exit 0, no traceback | 5/5, exit 0 | 5/5, exit 0 | 5/5, exit 0 | MET |
+| 4. A job whose call failed is still pending afterwards | 5 of 5 | 0/5 | 0/5 | 0/5 | MISSED |
+| 5. `llm_call` under 6 s | 9 of 10 | 10/10 | 10/10 | 10/10 | MET |
+
+The three normal trials produced the same ten scores each time
+(`[3, 2, 2, 2, 2, 6, 3, 2, 2, 3]`). I checked that they really re-ran: each trial has its own
+`run_id`, its own timestamps, and slightly different costs and durations (mean cost
+0.00265, 0.00263, 0.0026; mean duration
+3664, 3490, 3371 ms). The scorer calls with
+temperature 0.2 and asks for a single integer, so Haiku repeating itself on the same
+input is the expected behavior, not a sign of a cached result.
+
+One thing went wrong in the first pass of these trials: the trial runner named the
+per-trial log file after the label only, so the failure trials (`--label before
+--fail-mode timeout`) overwrote the three normal trials' `trial-before-N.jsonl` files.
+The summary numbers survived in a separate file, but the raw records did not, and the
+criteria require pasted real output. I fixed the naming (the failure mode is now part of
+the file name) and re-ran both sets with the system unchanged. The numbers below are from
+that second pass; the first pass had the same verdicts on every criterion.
+
+*Criterion 1, real output.* Trial 1's record counts from `scripts/capstone_trial.py`
+(`run_trial()`), reading `trial-before-1.jsonl`; the run log held one `run_id`
+(`b061d4f6`):
+
+```
+"jobs_requested": 10,
+"llm_call_records": 10,
+"job_scored_records": 10,
+"malformed_lines": 0,
+```
+
+*Criterion 2, real output.* The first `job_scored` record of trial 1, written by
+`score_job()` in `src/applypilot/scoring/scorer.py`. It has no `model` field:
+
+```
+{"ts": "2026-11-13T20:53:24.641+00:00", "run_id": "b061d4f6", "event": "job_scored", "stage": "score", "job_url": "https://www.linkedin.com/jobs/view/4378952516", "job_title": "Data Analyst", "status": "ok", "score": 3, "parse_ok": true, "keywords_chars": 127, "reasoning_chars": 769, "duration_ms": 6175}
+```
+
+*Criterion 3, real output.* The first two records of failure trial 1
+(`trial-before-timeout-1.jsonl`, written by `LLMClient.chat()` in `src/applypilot/llm.py`
+and `score_job()` in `scorer.py`), and the lines from the process output that show the
+stage finishing:
+
+```
+{"ts": "2026-11-13T20:55:10.360+00:00", "run_id": "15a05224", "event": "llm_call", "stage": "score", "job_url": "https://www.linkedin.com/jobs/view/4469784755", "job_title": "Junior Actuarial Analyst", "status": "error", "provider": "claude-code", "model": "haiku", "input_chars": 9068, "output_chars": 0, "duration_ms": 581, "error": "TimeoutExpired: Command '['C:\\\\Users\\\\caomi\\\\.local\\\\bin\\\\claude.EXE', '-p', '--model', 'haiku', '--tools', '', '--output-format', 'json', '--no-session-persistence', '--disable-slash-commands', '--strict-mcp-config', '--system-prompt', \"You are a job fit evaluator. Given a candidate's resume and a job description,"}
+{"ts": "2026-11-13T20:55:10.362+00:00", "run_id": "15a05224", "event": "job_scored", "stage": "score", "job_url": "https://www.linkedin.com/jobs/view/4469784755", "job_title": "Junior Actuarial Analyst", "status": "error", "score": 0, "parse_ok": false, "duration_ms": 1281, "error": "TimeoutExpired: Command '['C:\\\\Users\\\\caomi\\\\.local\\\\bin\\\\claude.EXE', '-p', '--model', 'haiku', '--tools', '', '--output-format', 'json', '--no-session-persistence', '--disable-slash-commands', '--strict-mcp-config', '--system-prompt', \"You are a job fit evaluator. Given a candidate's resume and a job description,"}
+```
+```
+exit=0
+  Stage 'score' completed in 3.8s — ok
+15:55:12 - INFO - Done: 5 scored in 3.6s (1.4 jobs/sec)
+```
+
+*Criterion 4, real output.* The database copy after failure trial 3, queried for the five
+jobs that trial touched (`SELECT fit_score, substr(score_reasoning,1,60) FROM jobs WHERE url=?`):
+
+```
+https://www.linkedin.com/jobs/view/4469784755  fit_score=0  reasoning="\nLLM error: Command '['C:\\\\Users\\\\caomi\\\\.local\\\\bin\\\\claude"
+https://www.linkedin.com/jobs/view/4471678620  fit_score=0  reasoning="\nLLM error: Command '['C:\\\\Users\\\\caomi\\\\.local\\\\bin\\\\claude"
+https://www.linkedin.com/jobs/view/4470721072  fit_score=0  reasoning="\nLLM error: Command '['C:\\\\Users\\\\caomi\\\\.local\\\\bin\\\\claude"
+https://www.linkedin.com/jobs/view/4470716198  fit_score=0  reasoning="\nLLM error: Command '['C:\\\\Users\\\\caomi\\\\.local\\\\bin\\\\claude"
+https://www.linkedin.com/jobs/view/4470580098  fit_score=0  reasoning="\nLLM error: Command '['C:\\\\Users\\\\caomi\\\\.local\\\\bin\\\\claude"
+```
+
+*Criterion 5, real output.* The ten `duration_ms` values of trial 1's `llm_call` records:
+
+```
+[5425, 3331, 3320, 3430, 3336, 3548, 3664, 3418, 3299, 3868]
+```
+
+*Diagnosis of criterion 2 (MISSED, 10 of 20 in every normal trial and
+5 of 10 in every failure trial).* Exactly the `job_scored` records fail, and they all
+fail on the same field: `model`. The stage is the scorer's record in
+`score_job()`. The mechanism: `model` is an attribute of the `LLMClient` object, and only
+`LLMClient.chat()` puts it in its own record; the scorer sets its context (`stage`,
+`job_url`, `job_title`) before it ever fetches the client, so the per-job record never
+sees the model name. The criterion asked for it on every record on purpose, because
+`job_scored` is the record I would read to compare scores across models, and right now
+it cannot tell haiku from qwen3. The fix is one line (put `client.model` into the
+context), but it is not the improvement I made this unit, see below.
+
+*Diagnosis of criterion 4 (MISSED, 0 of 5 in all three trials).* The stage is
+`run_scoring()` in `scorer.py`. The mechanism: `score_job()` returns `{"score": 0, ...}`
+when the LLM call raises, and `run_scoring()` writes that result to the database exactly
+like a real score (`UPDATE jobs SET fit_score = 0, scored_at = now`). The pending-score
+query selects `fit_score IS NULL`, and 0 is not NULL, so a job whose call timed out
+leaves the pipeline for good. The run log is what made this visible: the five
+`job_scored` records say `status = error`, and the database says those same five jobs
+are scored. Before this unit, the database alone would have shown five jobs with score 0
+and a reasoning column that starts with "LLM error", which nobody queries for.
+
+*Pattern.* Both misses are in `scorer.py`'s handling of one job, but they are two
+mechanisms, not one: a missing field in a record versus a failure written to the database
+as a result. The second one loses applications, so it is the one I fixed.
