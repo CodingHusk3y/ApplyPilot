@@ -98,6 +98,14 @@ def run(
             "lenient: banned words ignored, LLM judge skipped (fastest, fewest API calls)."
         ),
     ),
+    limit: int = typer.Option(
+        0, "--limit", "-l",
+        help="Score stage only: score at most N jobs this run (0 = all pending).",
+    ),
+    rescore: bool = typer.Option(
+        False, "--rescore",
+        help="Score stage only: re-score jobs that already have a fit_score.",
+    ),
 ) -> None:
     """Run pipeline stages: discover, enrich, score, tailor, cover, pdf."""
     _bootstrap()
@@ -137,6 +145,8 @@ def run(
         stream=stream,
         workers=workers,
         validation_mode=validation,
+        score_limit=limit,
+        rescore=rescore,
     )
 
     if result.get("errors"):
@@ -324,6 +334,73 @@ def apply(
         continuous=continuous,
         workers=workers,
     )
+
+
+@app.command()
+def runlog(
+    last: int = typer.Option(10, "--last", "-n", help="How many of the most recent records to list."),
+    event: str = typer.Option("llm_call", "--event", help="Record type to summarize: llm_call or job_scored."),
+    run_id: Optional[str] = typer.Option(None, "--run", help="Only records from this run id."),
+    as_json: bool = typer.Option(False, "--json", help="Print the summary as JSON instead of a table."),
+) -> None:
+    """Summarize the structured run log (logs/runs.jsonl): counts, errors, latency, cost."""
+    import json as _json
+    from applypilot.config import load_env
+    from applypilot import telemetry
+
+    load_env()
+    path = telemetry.log_path()
+    records = telemetry.read_records(path)
+    if run_id:
+        records = [r for r in records if r.get("run_id") == run_id]
+    if not records:
+        console.print(f"[yellow]No records in {path}[/yellow]")
+        raise typer.Exit(code=1)
+
+    summary = telemetry.summarize(records, event=event)
+    if as_json:
+        console.print(_json.dumps(summary, indent=2))
+        return
+
+    console.print(f"\n[bold]Run log:[/bold] {path}  ({len(records)} records total)\n")
+    table = Table(title=f"{event} summary", show_header=True, header_style="bold cyan")
+    table.add_column("Metric", style="bold")
+    table.add_column("Value", justify="right")
+    table.add_row("records", str(summary["count"]))
+    table.add_row("ok / errors", f"{summary['ok']} / {summary['errors']}")
+    table.add_row("duration mean / p50 / p95 / max (ms)",
+                  f"{summary['duration_ms_mean']:.0f} / {summary['duration_ms_p50']:.0f} / "
+                  f"{summary['duration_ms_p95']:.0f} / {summary['duration_ms_max']:.0f}")
+    if summary["cost_usd_mean"] is not None:
+        table.add_row("cost mean / total (USD)",
+                      f"{summary['cost_usd_mean']:.5f} / {summary['cost_usd_total']:.4f} "
+                      f"({summary['cost_known']} priced)")
+    if summary["input_tokens_mean"] is not None:
+        table.add_row("tokens in / out (mean)",
+                      f"{summary['input_tokens_mean']:.0f} / {summary['output_tokens_mean'] or 0:.0f}")
+    console.print(table)
+
+    recent = [r for r in records if r.get("event") == event][-last:]
+    if recent:
+        rows = Table(title=f"last {len(recent)} {event} records", show_header=True, header_style="bold")
+        rows.add_column("ts")
+        rows.add_column("run")
+        rows.add_column("status")
+        rows.add_column("ms", justify="right")
+        rows.add_column("cost", justify="right")
+        rows.add_column("job / error")
+        for r in recent:
+            cost = r.get("cost_usd")
+            detail = r.get("error") or r.get("job_title") or r.get("job_url") or ""
+            rows.add_row(
+                str(r.get("ts", ""))[11:23], str(r.get("run_id", "")),
+                "[green]ok[/green]" if r.get("status") == "ok" else "[red]error[/red]",
+                str(r.get("duration_ms", "")),
+                f"{cost:.5f}" if isinstance(cost, (int, float)) else "-",
+                str(detail)[:60],
+            )
+        console.print(rows)
+    console.print()
 
 
 @app.command()
