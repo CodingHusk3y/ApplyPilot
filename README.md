@@ -222,3 +222,51 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, coding standards, 
 ApplyPilot is licensed under the [GNU Affero General Public License v3.0](LICENSE).
 
 You are free to use, modify, and distribute this software. If you deploy a modified version as a service, you must release your source code under the same license.
+
+---
+
+## Capstone
+
+**What This Extends**
+
+This capstone extends ApplyPilot, the job-application pipeline in this repository
+(my fork of Pickle-Pixel/ApplyPilot). The system as it stood before this unit is the
+commit `ec306e7` ("Baseline before capstone"): a six-stage pipeline (discover, enrich,
+score, tailor, cover letter, auto-apply) that scores every discovered job against my
+resume with an LLM and tailors a resume for the good fits. My earlier work on it added
+the `LLM_PROVIDER=claude-code` path (scoring and tailoring through the logged-in
+`claude` CLI), an Ollama provider, and `applypilot add` for hand-picked job links.
+
+What is new in this unit is the operational layer around the **score** stage:
+
+- `src/applypilot/telemetry.py`: a structured JSONL run log. Every LLM call and every
+  scored job appends one record with a timestamp, run id, stage, job URL, model,
+  duration, token counts, dollar cost (when the provider reports it), and the error
+  text when something fails.
+- `LLMClient.chat()` now records every call, successful or not, through that module.
+  No stage had to change its call sites.
+- `applypilot run score --limit N --rescore`: a bounded, repeatable run so one
+  invocation does a fixed amount of work and can be timed and costed.
+- `applypilot runlog`: reads the run log back and answers "how many calls, how many
+  errors, how long, how much" without opening the file.
+
+**The Shape**
+
+Shape A, deploy and instrument. Before this unit the score stage only ever ran from my
+terminal with `print`-style progress lines and nothing kept afterwards: I could not say
+how long a job took to score, what it cost, or which jobs failed and why. The extension
+is the run path (RUNNING.md, Path B: local with a committed log), the instrumentation,
+and the measured numbers that come out of it.
+
+Out of scope, decided before building:
+
+- Not instrumenting the auto-apply stage. The browser agent runs through MCP in a
+  separate process and its failures are mostly site-specific; it would take the
+  whole unit on its own.
+- Not touching discovery or enrichment (the scrapers). They hit live job boards, so a
+  trial would not be repeatable from one hour to the next.
+- Not hosting it. The pipeline needs my resume, my profile and a logged-in `claude`
+  CLI on the machine that runs it, and the hosted free tier could not hold that.
+- Not changing how scoring works. Same prompt, same model, same parser. Anything the
+  log reveals about scoring quality goes in "What's Still Broken", not into a fix this
+  unit, unless the diagnosis in Milestone 6 points there.
