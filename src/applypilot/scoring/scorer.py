@@ -168,11 +168,22 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
 
         # Write each score immediately so downstream stages (and other
         # terminals) can pick it up, and an interrupted run keeps its progress.
-        conn.execute(
-            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
-            (result["score"], f"{result['keywords']}\n{result['reasoning']}",
-             datetime.now(timezone.utc).isoformat(), result["url"]),
-        )
+        if result["score"] == 0:
+            # The LLM call failed or its reply could not be parsed. Leave
+            # fit_score untouched (NULL for a new job) so the next run retries
+            # it, and keep the error text in score_reasoning for inspection.
+            # Capstone improvement: before this, 0 was written as a real score
+            # and the job silently left the pending-score queue for good.
+            conn.execute(
+                "UPDATE jobs SET score_reasoning = ? WHERE url = ?",
+                (f"{result['keywords']}\n{result['reasoning']}", result["url"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
+                (result["score"], f"{result['keywords']}\n{result['reasoning']}",
+                 datetime.now(timezone.utc).isoformat(), result["url"]),
+            )
         conn.commit()
 
         log.info(
