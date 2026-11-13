@@ -454,3 +454,63 @@ and a reasoning column that starts with "LLM error", which nobody queries for.
 *Pattern.* Both misses are in `scorer.py`'s handling of one job, but they are two
 mechanisms, not one: a missing field in a record versus a failure written to the database
 as a result. The second one loses applications, so it is the one I fixed.
+
+**The Improvement**
+
+*What I changed.* One `if` in `run_scoring()` (`src/applypilot/scoring/scorer.py`). When
+`score_job()` comes back with `score == 0`, which is its signal for "the LLM call raised
+or the reply could not be parsed", the loop now updates only `score_reasoning` (so the
+error text is still inspectable) and leaves `fit_score` and `scored_at` alone. Before,
+it wrote `fit_score = 0` and `scored_at = now` for every result, error or not. Nothing
+else changed: same prompt, same model, same parser, same log records.
+
+*Why.* It follows directly from the criterion 4 diagnosis: the pending-score query is
+`fit_score IS NULL`, and the scorer was turning a transient failure into a permanent
+non-NULL value. Leaving the column NULL is the smallest change that puts the job back in
+the queue. I chose not to add a retry counter in the same change, because one change
+should be one mechanism; the trade-off that creates is in "What's Still Broken".
+
+*Before* (from Run Log and Verdicts above):
+
+| Criterion | Target | Run 1 | Run 2 | Run 3 | Verdict |
+|---|---|---|---|---|---|
+| 1. Every scored job leaves exactly one `llm_call` and one `job_scored` record | 10+10 of 10+10, 0 malformed | 10+10 | 10+10 | 10+10 | MET |
+| 2. Every record has the required fields | 20 of 20 (normal), 10 of 10 (failure) | 10/20, 5/10 | 10/20, 5/10 | 10/20, 5/10 | MISSED |
+| 3. Provider failure: stage finishes, every failure recorded with its exception type | 5 of 5, exit 0, no traceback | 5/5, exit 0 | 5/5, exit 0 | 5/5, exit 0 | MET |
+| 4. A job whose call failed is still pending afterwards | 5 of 5 | 0/5 | 0/5 | 0/5 | MISSED |
+| 5. `llm_call` under 6 s | 9 of 10 | 10/10 | 10/10 | 10/10 | MET |
+
+*After* (same trials, same jobs, same `LLM_TIMEOUT=0.2` failure mode, run with the change applied):
+
+| Criterion | Target | Run 1 | Run 2 | Run 3 | Verdict |
+|---|---|---|---|---|---|
+| 1. Every scored job leaves exactly one `llm_call` and one `job_scored` record | 10+10 of 10+10, 0 malformed | 10+10 | 10+10 | 10+10 | MET |
+| 2. Every record has the required fields | 20 of 20 (normal), 10 of 10 (failure) | 10/20, 5/10 | 10/20, 5/10 | 10/20, 5/10 | MISSED |
+| 3. Provider failure: stage finishes, every failure recorded with its exception type | 5 of 5, exit 0, no traceback | 5/5, exit 0 | 5/5, exit 0 | 5/5, exit 0 | MET |
+| 4. A job whose call failed is still pending afterwards | 5 of 5 | 5/5 | 5/5 | 5/5 | MET |
+| 5. `llm_call` under 6 s | 9 of 10 | 10/10 | 10/10 | 10/10 | MET |
+
+*Did it help.* Yes, on the thing it was aimed at: criterion 4 went from 0 of 5 to 5 of 5
+in all three trials. Nothing else moved. Criterion 2 is still missed by exactly the same
+records for exactly the same reason, which is what I expected since the change did not
+touch the log. Latency and cost after the change (mean 3586 ms,
+$0.00265 per job) are within noise of before
+(3508 ms, $0.00263).
+
+*Real output for criterion 4 after the change.* The database copy after failure trial 3,
+same query as before (`fit_score` is now NULL, printed as `None`, and the error text is
+kept):
+
+```
+https://www.linkedin.com/jobs/view/4469784755  fit_score=None  reasoning="\nLLM error: Command '['C:\\\\Users\\\\caomi\\"
+https://www.linkedin.com/jobs/view/4471678620  fit_score=None  reasoning="\nLLM error: Command '['C:\\\\Users\\\\caomi\\"
+https://www.linkedin.com/jobs/view/4470721072  fit_score=None  reasoning="\nLLM error: Command '['C:\\\\Users\\\\caomi\\"
+https://www.linkedin.com/jobs/view/4470716198  fit_score=None  reasoning="\nLLM error: Command '['C:\\\\Users\\\\caomi\\"
+https://www.linkedin.com/jobs/view/4470580098  fit_score=None  reasoning="\nLLM error: Command '['C:\\\\Users\\\\caomi\\"
+```
+
+and the matching `job_scored` record from that trial, unchanged in shape:
+
+```
+{"ts": "2026-11-13T20:57:51.383+00:00", "run_id": "0debe35a", "event": "job_scored", "stage": "score", "job_url": "https://www.linkedin.com/jobs/view/4469784755", "job_title": "Junior Actuarial Analyst", "status": "error", "score": 0, "parse_ok": false, "duration_ms": 1395, "error": "TimeoutExpired: Command '['C:\\\\Users\\\\caomi\\\\.local\\\\bin\\\\claude.EXE', '-p', '--model', 'haiku', '--tools', '', '--output-format', 'json', '--no-session-persistence', '--disable-slash-commands', '--strict-mcp-config', '--system-prompt', \"You are a job fit evaluator. Given a candidate's resume and a job description,"}
+```
