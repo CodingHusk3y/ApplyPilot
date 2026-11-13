@@ -11,7 +11,10 @@ Each trial:
 Usage:
   python scripts/capstone_trial.py --home PATH [--trials 3] [--jobs 10]
                                    [--label before] [--fail-mode timeout|badmodel]
-                                   [--latency-ms 10000]
+                                   [--latency-ms 6000] [--pending]
+
+--pending scores jobs that have no fit_score yet (no --rescore), and afterwards
+checks how many of them are still pending in the database, i.e. retryable.
 
 --fail-mode breaks the LLM provider on purpose so the error path can be tested:
   timeout   LLM_TIMEOUT=0.2  (every call is killed before it can answer)
@@ -24,6 +27,7 @@ import argparse
 import json
 import os
 import shutil
+import sqlite3
 import statistics
 import subprocess
 import sys
@@ -50,7 +54,7 @@ def read_jsonl(path: Path) -> list[dict]:
 
 
 def run_trial(home: Path, k: int, jobs: int, label: str, fail_mode: str | None,
-              latency_ms: int) -> dict:
+              latency_ms: int, pending: bool = False) -> dict:
     snapshot = home / "applypilot.snapshot.db"
     if snapshot.exists():
         shutil.copyfile(snapshot, home / "applypilot.db")
@@ -71,7 +75,9 @@ def run_trial(home: Path, k: int, jobs: int, label: str, fail_mode: str | None,
     elif fail_mode == "badmodel":
         env["LLM_MODEL"] = "no-such-model"
 
-    cmd = [sys.executable, "-m", "applypilot", "run", "score", "--limit", str(jobs), "--rescore"]
+    cmd = [sys.executable, "-m", "applypilot", "run", "score", "--limit", str(jobs)]
+    if not pending:
+        cmd.append("--rescore")
     t0 = time.perf_counter()
     proc = subprocess.run(cmd, env=env, capture_output=True, text=True,
                           encoding="utf-8", errors="replace")
@@ -98,6 +104,18 @@ def run_trial(home: Path, k: int, jobs: int, label: str, fail_mode: str | None,
     durations = [r["duration_ms"] for r in calls if r.get("duration_ms") is not None]
     costs = [r["cost_usd"] for r in ok_calls if r.get("cost_usd") is not None]
     crashed = "Traceback" in proc.stderr or "STAGE FAILED" in proc.stdout
+    stage_completed = "Stage 'score' completed" in proc.stdout
+
+    # Criterion 4: are the jobs this run touched still retryable (fit_score NULL)?
+    still_pending = None
+    if scored:
+        conn = sqlite3.connect(home / "applypilot.db")
+        urls = [r.get("job_url") for r in scored if r.get("job_url")]
+        still_pending = sum(
+            1 for u in urls
+            if conn.execute("SELECT fit_score IS NULL FROM jobs WHERE url = ?", (u,)).fetchone()[0]
+        )
+        conn.close()
 
     return {
         "trial": k,
@@ -116,6 +134,8 @@ def run_trial(home: Path, k: int, jobs: int, label: str, fail_mode: str | None,
         "errors_with_message": sum(1 for r in err_calls if r.get("error")),
         "jobs_error_with_message": sum(1 for r in scored if r.get("status") != "ok" and r.get("error")),
         "stage_crashed": crashed,
+        "stage_completed": stage_completed,
+        "jobs_still_pending_after_run": still_pending,
         f"calls_under_{latency_ms}ms": sum(1 for d in durations if d < latency_ms),
         "duration_ms_mean": round(statistics.mean(durations)) if durations else None,
         "duration_ms_max": max(durations) if durations else None,
@@ -134,14 +154,17 @@ def main() -> None:
     ap.add_argument("--jobs", type=int, default=10)
     ap.add_argument("--label", default="before")
     ap.add_argument("--fail-mode", choices=("timeout", "badmodel"), default=None)
-    ap.add_argument("--latency-ms", type=int, default=10000)
+    ap.add_argument("--latency-ms", type=int, default=6000)
+    ap.add_argument("--pending", action="store_true",
+                    help="Score unscored jobs (omit --rescore) and report how many stay pending afterwards.")
     args = ap.parse_args()
 
     results = []
     for k in range(1, args.trials + 1):
         print(f"--- trial {k}/{args.trials} ({args.label}{', ' + args.fail_mode if args.fail_mode else ''}) ---",
               flush=True)
-        r = run_trial(args.home.resolve(), k, args.jobs, args.label, args.fail_mode, args.latency_ms)
+        r = run_trial(args.home.resolve(), k, args.jobs, args.label, args.fail_mode,
+                      args.latency_ms, pending=args.pending)
         results.append(r)
         print(json.dumps(r, indent=2), flush=True)
 

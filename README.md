@@ -270,3 +270,80 @@ Out of scope, decided before building:
 - Not changing how scoring works. Same prompt, same model, same parser. Anything the
   log reveals about scoring quality goes in "What's Still Broken", not into a fix this
   unit, unless the diagnosis in Milestone 6 points there.
+
+**Running It**
+
+Path B, local with logs. The exact command, what the environment needs, and how the
+trials are run are in [RUNNING.md](RUNNING.md). In one line:
+
+```bash
+python -m applypilot run score --limit 10 --rescore     # then: python -m applypilot runlog
+```
+
+I tested the instructions from a clean clone into a fresh virtual environment. It ran
+first time; what it caught was that my dependency pins were not the versions a fresh
+environment installs. The note at the end of RUNNING.md has the details.
+
+**Instrumentation**
+
+Every run appends to `<data dir>/logs/runs.jsonl` (override with `APPLYPILOT_RUN_LOG`).
+Two record types, one JSON object per line, written by `src/applypilot/telemetry.py`:
+
+- `llm_call`, written by `LLMClient.chat()` in `src/applypilot/llm.py` for every call,
+  successful or not: `ts`, `run_id` (one per process), `event`, `stage`, `job_url`,
+  `job_title`, `status` (`ok`/`error`), `provider`, `model`, `input_chars`, `output_chars`,
+  `duration_ms` (wall clock, includes starting the `claude` process), `input_tokens`,
+  `output_tokens`, `cache_read_tokens`, `cache_write_tokens`, `cost_usd` (as reported by
+  the CLI's `total_cost_usd`), `provider_duration_ms` (the CLI's own `duration_api_ms`),
+  and `error` (exception type and message) on failure.
+- `job_scored`, written by `score_job()` in `src/applypilot/scoring/scorer.py` once per
+  job: the same context fields plus `score`, `parse_ok`, `keywords_chars`,
+  `reasoning_chars`, `duration_ms` for the whole job, and `error` when the call failed
+  or the reply could not be parsed.
+
+Ten `llm_call` entries from one real session (`run_id` 5ad0e06a, the ten-job cost
+measurement below), pasted as written:
+
+```
+{"ts": "2026-11-13T20:44:15.657+00:00", "run_id": "5ad0e06a", "event": "llm_call", "stage": "score", "job_url": "https://www.linkedin.com/jobs/view/4378952516", "job_title": "Data Analyst", "status": "ok", "provider": "claude-code", "model": "haiku", "input_chars": 6098, "output_chars": 745, "duration_ms": 3558, "input_tokens": 1507, "output_tokens": 165, "cache_read_tokens": 0, "cache_write_tokens": 0, "cost_usd": 0.002332, "provider_duration_ms": 2095}
+{"ts": "2026-11-13T20:44:18.950+00:00", "run_id": "5ad0e06a", "event": "llm_call", "stage": "score", "job_url": "https://www.linkedin.com/jobs/view/4381028541", "job_title": "Technical Data Analyst", "status": "ok", "provider": "claude-code", "model": "haiku", "input_chars": 6320, "output_chars": 708, "duration_ms": 3287, "input_tokens": 1566, "output_tokens": 135, "cache_read_tokens": 0, "cache_write_tokens": 0, "cost_usd": 0.002241, "provider_duration_ms": 1965}
+{"ts": "2026-11-13T20:44:22.285+00:00", "run_id": "5ad0e06a", "event": "llm_call", "stage": "score", "job_url": "https://www.linkedin.com/jobs/view/4473687078", "job_title": "Senior Associate & Manager", "status": "ok", "provider": "claude-code", "model": "haiku", "input_chars": 6617, "output_chars": 655, "duration_ms": 3330, "input_tokens": 1645, "output_tokens": 145, "cache_read_tokens": 0, "cache_write_tokens": 0, "cost_usd": 0.0023699999999999997, "provider_duration_ms": 2062}
+{"ts": "2026-11-13T20:44:25.594+00:00", "run_id": "5ad0e06a", "event": "llm_call", "stage": "score", "job_url": "https://www.linkedin.com/jobs/view/4473677293", "job_title": "Manager, Strategy", "status": "ok", "provider": "claude-code", "model": "haiku", "input_chars": 9508, "output_chars": 705, "duration_ms": 3305, "input_tokens": 2214, "output_tokens": 134, "cache_read_tokens": 0, "cache_write_tokens": 0, "cost_usd": 0.002884, "provider_duration_ms": 2039}
+{"ts": "2026-11-13T20:44:29.679+00:00", "run_id": "5ad0e06a", "event": "llm_call", "stage": "score", "job_url": "https://www.linkedin.com/jobs/view/4475422891", "job_title": "Tax Manager", "status": "ok", "provider": "claude-code", "model": "haiku", "input_chars": 8235, "output_chars": 900, "duration_ms": 4088, "input_tokens": 1958, "output_tokens": 186, "cache_read_tokens": 0, "cache_write_tokens": 0, "cost_usd": 0.002888, "provider_duration_ms": 2682}
+{"ts": "2026-11-13T20:44:33.471+00:00", "run_id": "5ad0e06a", "event": "llm_call", "stage": "score", "job_url": "https://www.linkedin.com/jobs/view/4476757057", "job_title": "Pricing Specialist", "status": "ok", "provider": "claude-code", "model": "haiku", "input_chars": 9850, "output_chars": 826, "duration_ms": 3780, "input_tokens": 2175, "output_tokens": 163, "cache_read_tokens": 0, "cache_write_tokens": 0, "cost_usd": 0.0029899999999999996, "provider_duration_ms": 2485}
+{"ts": "2026-11-13T20:44:36.993+00:00", "run_id": "5ad0e06a", "event": "llm_call", "stage": "score", "job_url": "https://www.linkedin.com/jobs/view/4473594738", "job_title": "Category Sales Analyst", "status": "ok", "provider": "claude-code", "model": "haiku", "input_chars": 9204, "output_chars": 647, "duration_ms": 3516, "input_tokens": 2153, "output_tokens": 134, "cache_read_tokens": 0, "cache_write_tokens": 0, "cost_usd": 0.002823, "provider_duration_ms": 2153}
+{"ts": "2026-11-13T20:44:40.720+00:00", "run_id": "5ad0e06a", "event": "llm_call", "stage": "score", "job_url": "https://www.linkedin.com/jobs/view/4464118805", "job_title": "Senior Development Analyst (Commercial Real Estate)", "status": "ok", "provider": "claude-code", "model": "haiku", "input_chars": 6885, "output_chars": 903, "duration_ms": 3723, "input_tokens": 1611, "output_tokens": 174, "cache_read_tokens": 0, "cache_write_tokens": 0, "cost_usd": 0.002481, "provider_duration_ms": 2342}
+{"ts": "2026-11-13T20:44:44.073+00:00", "run_id": "5ad0e06a", "event": "llm_call", "stage": "score", "job_url": "https://www.linkedin.com/jobs/view/4476365520", "job_title": "Acquisition Associate", "status": "ok", "provider": "claude-code", "model": "haiku", "input_chars": 6412, "output_chars": 670, "duration_ms": 3348, "input_tokens": 1551, "output_tokens": 135, "cache_read_tokens": 0, "cache_write_tokens": 0, "cost_usd": 0.002226, "provider_duration_ms": 1996}
+{"ts": "2026-11-13T20:44:48.027+00:00", "run_id": "5ad0e06a", "event": "llm_call", "stage": "score", "job_url": "https://www.linkedin.com/jobs/view/4467274198", "job_title": "Data Solution Consultant", "status": "ok", "provider": "claude-code", "model": "haiku", "input_chars": 10255, "output_chars": 906, "duration_ms": 3946, "input_tokens": 2343, "output_tokens": 178, "cache_read_tokens": 0, "cache_write_tokens": 0, "cost_usd": 0.0032329999999999998, "provider_duration_ms": 2662}
+```
+
+One failed run, triggered on purpose with `LLM_TIMEOUT=0.2` so the `claude` subprocess is
+killed before it answers. Both records are written and the stage finishes instead of
+crashing (the `error` field is the exception text, cut at 300 characters):
+
+```
+{"ts": "2026-11-13T20:44:50.885+00:00", "run_id": "66f2c9c6", "event": "llm_call", "stage": "score", "job_url": "https://www.linkedin.com/jobs/view/4378952516", "job_title": "Data Analyst", "status": "error", "provider": "claude-code", "model": "haiku", "input_chars": 6098, "output_chars": 0, "duration_ms": 573, "error": "TimeoutExpired: Command '['C:\\\\Users\\\\caomi\\\\.local\\\\bin\\\\claude.EXE', '-p', '--model', 'haiku', '--tools', '', '--output-format', 'json', '--no-session-persistence', '--disable-slash-commands', '--strict-mcp-config', '--system-prompt', \"You are a job fit evaluator. Given a candidate's resume and a job description,"}
+{"ts": "2026-11-13T20:44:50.887+00:00", "run_id": "66f2c9c6", "event": "job_scored", "stage": "score", "job_url": "https://www.linkedin.com/jobs/view/4378952516", "job_title": "Data Analyst", "status": "error", "score": 0, "parse_ok": false, "duration_ms": 1267, "error": "TimeoutExpired: Command '['C:\\\\Users\\\\caomi\\\\.local\\\\bin\\\\claude.EXE', '-p', '--model', 'haiku', '--tools', '', '--output-format', 'json', '--no-session-persistence', '--disable-slash-commands', '--strict-mcp-config', '--system-prompt', \"You are a job fit evaluator. Given a candidate's resume and a job description,"}
+```
+
+**What It Costs**
+
+One run here means scoring one job: one prompt (system instructions + resume + job
+description) through `claude -p --model haiku`, one reply. The cost comes from the
+`total_cost_usd` field the Claude Code CLI returns with each JSON result, which the
+run log stores as `cost_usd`. I ran the stage on ten jobs
+(`python -m applypilot run score --limit 10 --rescore`) and averaged the ten records
+with `python -m applypilot runlog --json`:
+
+| Measure (10 jobs, one session) | Value |
+|---|---|
+| Mean cost per scored job | $0.00265 |
+| Total for the ten | $0.0265 |
+| Min / max per job | $0.00223 / $0.00323 |
+| Mean input / output tokens | 1872 / 155 |
+| Mean wall time per job | 3.6 s (CLI-reported API time 2.2 s) |
+
+This is API-equivalent spend as priced by the CLI; on a subscription plan it is drawn
+from the plan's usage allowance rather than billed per call. The hundred-a-day
+arithmetic is finished in Milestone 7 below, once the trials give a number from more
+than one session.
