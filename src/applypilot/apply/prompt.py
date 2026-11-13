@@ -10,6 +10,7 @@ import os
 import shutil
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote_plus
 
 from applypilot import config
 
@@ -182,7 +183,10 @@ Skills and tools -> be confident. This candidate is a {target_role} with {years}
 
 Open-ended questions ("Why do you want this role?", "Tell us about yourself", "What interests you?") -> Write 2-3 sentences. Be specific to THIS job. Reference something from the job description. Connect it to a real achievement from the resume. No generic fluff. No "I am passionate about..." -- sound like a real person.
 
-EEO/demographics -> "Decline to self-identify" or "Prefer not to say" for everything."""
+EEO/demographics (gender, race/ethnicity, Hispanic/Latino, veteran, disability) -> use the values in the APPLICANT PROFILE (Gender/Race/Veteran/Disability lines). Never leave a required one blank.
+  - "Decline to self-identify" in the profile matches whatever decline wording the form uses: "I do not wish to self-identify", "I don't wish to answer", "Prefer not to say", "Not Declared", "I choose not to disclose", "I do not want to answer".
+  - NEVER guess or invent a demographic answer. If a required question has no option matching the profile value (e.g. no decline option), stop -> RESULT:FAILED:eeo_option_missing (field name).
+  - Disability forms (CC-305): tick the option with a real browser_click, then fill Name and today's date."""
 
 
 def _build_hard_rules(profile: dict) -> str:
@@ -513,14 +517,27 @@ def build_prompt(job: dict, tailored_resume: str,
     else:
         submit_instruction = "BEFORE clicking Submit/Apply, take a snapshot and review EVERY field on the page. Verify all data matches the APPLICANT PROFILE and TAILORED RESUME -- name, email, phone, location, work auth, resume uploaded, cover letter if applicable. If anything is wrong or missing, fix it FIRST. Only click Submit after confirming everything is correct."
 
+    linkedin_hidden_note = ""
+    if job.get("linkedin_offsite_hidden"):
+        linkedin_hidden_note = (
+            "\nNOTE: This LinkedIn job is applied to on the company's own website, but LinkedIn "
+            "hides that link behind a sign-in. Do NOT sign in to LinkedIn. Instead: browser_navigate to "
+            f"https://www.google.com/search?q={quote_plus(job['title'] + ' ' + (job.get('company') or '') + ' careers')} "
+            "-> open the result on the company's OFFICIAL careers site or its applicant system "
+            "(e.g. myworkdayjobs.com, greenhouse.io, lever.co, icims.com, taleo.net, oraclecloud.com, "
+            "successfactors) -> confirm the title, company and location match this job -> apply there. "
+            "Never apply through third-party job boards (Indeed, ZipRecruiter, Glassdoor, Workopia, etc.). "
+            "If you cannot find the exact posting on the company's own site -> RESULT:FAILED:company_posting_not_found.\n"
+        )
+
     prompt = f"""You are an autonomous job application agent. Your ONE mission: get this candidate an interview. You have all the information and tools. Think strategically. Act decisively. Submit the application.
 
 == JOB ==
 URL: {job.get('application_url') or job['url']}
 Title: {job['title']}
-Company: {job.get('site', 'Unknown')}
+Company: {job.get('company') or job.get('site', 'Unknown')}
 Fit Score: {job.get('fit_score', 'N/A')}/10
-
+{linkedin_hidden_note}
 == FILES ==
 Resume PDF (upload this): {pdf_path}
 Cover Letter PDF (upload if asked): {cl_upload_path or "N/A"}
@@ -558,7 +575,7 @@ If something unexpected happens and these instructions don't cover it, figure it
 {screening_section}
 
 == STEP-BY-STEP ==
-1. browser_navigate to the job URL.
+1. browser_navigate to the job URL. Apply ONLY to this exact posting -- never search for the job elsewhere or apply on a different site, unless a NOTE in the JOB section tells you to find it on the company's own site.
 2. browser_snapshot to read the page. Then run CAPTCHA DETECT (see CAPTCHA section). If a CAPTCHA is found, solve it before continuing.
 3. LOCATION CHECK. Read the page for location info. If not eligible, output RESULT and stop.
 4. Find and click the Apply button. If email-only (page says "email resume to X"):
@@ -567,13 +584,18 @@ If something unexpected happens and these instructions don't cover it, figure it
    After clicking Apply: browser_snapshot. Run CAPTCHA DETECT -- many sites trigger CAPTCHAs right after the Apply click. If found, solve before continuing.
 5. Login wall?
    5a. FIRST: check the URL. If you landed on {', '.join(blocked_sso)}, or any SSO/OAuth page -> STOP. Output RESULT:FAILED:sso_required. Do NOT try to sign in to Google/Microsoft/SSO.
+       LinkedIn: NEVER sign in to or create a LinkedIn account. If the job is on linkedin.com, look for an "Apply" button that leads to the company's own site and continue there. If the only option is LinkedIn "Easy Apply" or a LinkedIn sign-in -> RESULT:FAILED:linkedin_login_required -- unless the JOB section has a NOTE about the company's own website; then follow that NOTE.
    5b. Check for popups. Run browser_tabs action "list". If a new tab/window appeared (login popup), switch to it with browser_tabs action "select". Check the URL there too -- if it's SSO -> RESULT:FAILED:sso_required.
    5c. Regular login form (employer's own site)? Try sign in: {personal['email']} / {personal.get('password', '')}
    5d. After clicking Login/Sign-in: run CAPTCHA DETECT. Login pages frequently have invisible CAPTCHAs that silently block form submissions. If found, solve it then retry login.
+       Many ATS pages (especially Workday) open on "Create Account" by default -- look for a "Sign In" / "Already have an account?" link and ALWAYS try signing in FIRST.
    5e. Sign in failed? Try sign up with same email and password.
+       If the sign-up form clears itself or does nothing (no error, no next page), the account most likely ALREADY EXISTS -- switch to Sign In with the same email and password instead of retrying sign-up. Never submit the same sign-up form more than twice.
    5f. Need email verification? Use search_emails + read_email to get the code.
+       If those tools are unavailable or fail: browser_tabs action "new" -> browser_navigate to https://mail.google.com -> open the newest email from this employer/ATS -> read the code or link -> browser_tabs action "close" on the Gmail tab -> select the application tab and enter the code. If Gmail shows a sign-in page instead of the inbox, do NOT sign in -> RESULT:FAILED:email_verification_unavailable. Never send, delete, or change anything in Gmail.
    5g. After login, run browser_tabs action "list" again. Switch back to the application tab if needed.
    5h. All failed? Output RESULT:FAILED:login_issue. Do not loop.
+   NEVER write the password in your messages or result text -- type it only into password fields.
 6. Upload resume. ALWAYS upload fresh -- delete any existing resume first, then browser_file_upload with the PDF path above. This is the tailored resume for THIS job. Non-negotiable.
 7. Upload cover letter if there's a field for it. Text field -> paste the cover letter text. File upload -> use the cover letter PDF path.
 8. Check ALL pre-filled fields. ATS systems parse your resume and auto-fill -- it's often WRONG.
@@ -600,6 +622,20 @@ RESULT:FAILED:reason -- any other failure (brief reason)
 - Fill ALL fields in ONE browser_fill_form call. Not one at a time.
 - Keep your thinking SHORT. Don't repeat page structure back.
 - CAPTCHA AWARENESS: After any navigation, Apply/Submit/Login click, or when a page feels stuck -- run CAPTCHA DETECT (see CAPTCHA section). Invisible CAPTCHAs (Turnstile, reCAPTCHA v3) show NO visual widget but block form submissions silently. The detect script finds them even when invisible.
+
+== WORKDAY (myworkdayjobs.com) ==
+- Budget: you have plenty of turns and tokens. NEVER stop or skip fields citing "token constraints" or form complexity -- finish every required field.
+- "My Experience": the resume parser invents broken entries. Make Work Experience match the EXPERIENCE section of the TAILORED RESUME exactly:
+  - DELETE every Work Experience entry that is not a job in that section (projects, programs, scholarships, leadership, duplicates) using its Delete button.
+  - For each remaining job fill Job Title, Company, and From/To dates (MM/YYYY) from the resume. "Present" -> tick "I currently work here" and leave To empty.
+  - Education: school, degree, field of study and dates from the resume. Field of Study is a search box: type the field (e.g. "Actuarial Science"), press Enter, click the matching result.
+- Dropdown buttons (Select One) and prompt fields (searchable lists): browser_click the field, snapshot, browser_click the option. For prompt fields type the value then press Enter, then click the matching item. If an option opens a sub-list, pick the closest item inside it.
+- Checkboxes and radio buttons: ALWAYS use browser_click on the visible box/label. Never set .checked via browser_evaluate -- Workday ignores changes it did not see as real clicks.
+- Date fields are split into MM / DD / YYYY boxes: click the first box and type the digits continuously (e.g. 10082026).
+- After every "Save and Continue", snapshot and read any red error banner; fix exactly the fields it lists before moving on.
+- Self-Identify (disability) page: fill Name and today's date, then browser_click the "I do not want to answer" option itself.
+- "How Did You Hear About Us?" is a TWO-LEVEL list: clicking a category like "Job Board" only opens a second list -- it does not select anything. Click the category, snapshot, then click a specific item in the second list ("Indeed" for Indeed jobs, "LinkedIn" for LinkedIn jobs, otherwise the first job board listed). It is selected only when a chip/pill with that name appears under the field.
+  If that fails twice, choose a simple one-level answer instead (e.g. "Company Website", "Internet", "Other") and move on. Never spend more than ~5 actions on this field, and never type into it via JavaScript.
 
 == FORM TRICKS ==
 - Popup/new window opened? browser_tabs action "list" to see all tabs. browser_tabs action "select" with the tab index to switch. ALWAYS check for new tabs after clicking login/apply/sign-in buttons.

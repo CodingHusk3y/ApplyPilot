@@ -2,11 +2,16 @@
 Unified LLM client for ApplyPilot.
 
 Auto-detects provider from environment:
+  LLM_PROVIDER=claude-code -> the logged-in `claude` CLI, billed to your Claude
+                    subscription instead of an API key (default model: haiku)
+  ANTHROPIC_API_KEY -> Anthropic Claude (default: claude-opus-5-5; needs `pip install anthropic`)
   GEMINI_API_KEY  -> Google Gemini (default: gemini-2.0-flash)
   OPENAI_API_KEY  -> OpenAI (default: gpt-4o-mini)
+  LLM_PROVIDER=ollama -> Ollama (default: http://127.0.0.1:11434/v1)
   LLM_URL         -> Local llama.cpp / Ollama compatible endpoint
 
 LLM_MODEL env var overrides the model name for any provider.
+LLM_TIMEOUT env var overrides the request timeout in seconds (default 120).
 """
 
 import logging
@@ -27,10 +32,31 @@ def _detect_provider() -> tuple[str, str, str]:
     Reads env at call time (not module import time) so that load_env() called
     in _bootstrap() is always visible here.
     """
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     openai_key = os.environ.get("OPENAI_API_KEY", "")
     local_url = os.environ.get("LLM_URL", "")
     model_override = os.environ.get("LLM_MODEL", "")
+    provider = os.environ.get("LLM_PROVIDER", "").lower()
+
+    # Explicit choice wins over any key or URL that is also set.
+    if os.environ.get("LLM_PROVIDER", "").lower() == _CLAUDE_CODE_PROVIDER:
+        # Same default as `applypilot apply --model`.
+        return (_CLAUDE_CODE_PROVIDER, model_override or "haiku", "")
+
+    if provider == "ollama":
+        return (
+            local_url.rstrip("/") if local_url else "http://127.0.0.1:11434/v1",
+            model_override or os.environ.get("OLLAMA_MODEL", "llama3.1"),
+            os.environ.get("LLM_API_KEY", ""),
+        )
+
+    if anthropic_key and not local_url:
+        return (
+            _ANTHROPIC_PROVIDER,
+            model_override or "claude-opus-5-5",
+            anthropic_key,
+        )
 
     if gemini_key and not local_url:
         return (
@@ -55,7 +81,7 @@ def _detect_provider() -> tuple[str, str, str]:
 
     raise RuntimeError(
         "No LLM provider configured. "
-        "Set GEMINI_API_KEY, OPENAI_API_KEY, or LLM_URL in your environment."
+        "Set ANTHROPIC_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY, or LLM_URL in your environment."
     )
 
 
@@ -74,6 +100,23 @@ _RATE_LIMIT_BASE_WAIT = 10
 _GEMINI_COMPAT_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
 _GEMINI_NATIVE_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
+# Claude goes through the official SDK, not an HTTP base URL.
+_ANTHROPIC_PROVIDER = "anthropic"
+
+# Claude via the `claude` CLI (Claude Code) using the user's subscription login.
+_CLAUDE_CODE_PROVIDER = "claude-code"
+_CLAUDE_CODE_TIMEOUT = 600  # seconds; overridden by LLM_TIMEOUT
+# Windows caps a command line at ~32K chars; longer system prompts go via stdin.
+_CLAUDE_CODE_MAX_ARG = 20000
+
+# Claude thinks before answering, and thinking tokens count toward max_tokens.
+# Callers size max_tokens for the visible answer only (as low as 512), so
+# raise the floor to leave room for both.
+_ANTHROPIC_MIN_MAX_TOKENS = 16000
+
+# Models that support the server-side refusal fallback (array form).
+_ANTHROPIC_FALLBACK_MODELS = {"claude-opus-5-5", "claude-opus-5", "claude-fable-5-1"}
+
 
 class LLMClient:
     """Thin LLM client supporting OpenAI-compatible and native Gemini endpoints.
@@ -88,10 +131,132 @@ class LLMClient:
         self.base_url = base_url
         self.model = model
         self.api_key = api_key
-        self._client = httpx.Client(timeout=_TIMEOUT)
+        # LLM_TIMEOUT overrides the default; slow local models need longer.
+        self._client = httpx.Client(timeout=float(os.environ.get("LLM_TIMEOUT") or _TIMEOUT))
         # True once we've confirmed the native Gemini API works for this model
         self._use_native_gemini: bool = False
         self._is_gemini: bool = base_url.startswith(_GEMINI_COMPAT_BASE)
+        self._is_anthropic: bool = base_url == _ANTHROPIC_PROVIDER
+        self._anthropic = None  # created lazily so the SDK stays optional
+        self._is_claude_code: bool = base_url == _CLAUDE_CODE_PROVIDER
+
+    # -- Claude Code CLI ----------------------------------------------------
+
+    def _chat_claude_code(self, messages: list[dict]) -> str:
+        """Run one prompt through `claude -p` with all tools disabled.
+
+        Uses whatever account the CLI is logged into, so it works with a
+        Claude Pro/Max/Team/Enterprise plan and no API key. Usage counts
+        against that plan's limits.
+        """
+        import json
+        import shutil
+        import subprocess
+
+        claude = shutil.which("claude")
+        if not claude:
+            raise RuntimeError(
+                "LLM_PROVIDER=claude-code but the `claude` CLI was not found on PATH."
+            )
+
+        system = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
+        convo = [m for m in messages if m["role"] in ("user", "assistant")]
+        if len(convo) == 1:
+            prompt = convo[0]["content"]
+        else:
+            prompt = "\n\n".join(f"[{m['role'].upper()}]\n{m['content']}" for m in convo)
+
+        cmd = [
+            claude, "-p",
+            "--model", self.model,
+            "--tools", "",
+            "--output-format", "json",
+            "--no-session-persistence",
+            "--disable-slash-commands",
+            "--strict-mcp-config",
+        ]
+        if system and len(system) <= _CLAUDE_CODE_MAX_ARG:
+            cmd += ["--system-prompt", system]
+        elif system:
+            prompt = f"<instructions>\n{system}\n</instructions>\n\n{prompt}"
+
+        # Allow running from inside a Claude Code terminal (nested sessions).
+        env = os.environ.copy()
+        env.pop("CLAUDECODE", None)
+        env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+        # The CLI enables extended thinking by default, which made a resume
+        # rewrite take ~14k tokens and ~2 min instead of ~800 tokens and ~9s.
+        # Set MAX_THINKING_TOKENS yourself to turn it back on.
+        env.setdefault("MAX_THINKING_TOKENS", "0")
+
+        timeout = float(os.environ.get("LLM_TIMEOUT") or _CLAUDE_CODE_TIMEOUT)
+        t0 = time.time()
+        proc = subprocess.run(
+            cmd, input=prompt, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", env=env, timeout=timeout,
+        )
+        log.info("claude CLI (%s): exit %d in %.1fs", self.model, proc.returncode, time.time() - t0)
+        try:
+            data = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            raise RuntimeError(
+                f"claude CLI failed (exit {proc.returncode}): "
+                f"{(proc.stderr or proc.stdout).strip()[:300]}"
+            )
+        if data.get("is_error"):
+            raise RuntimeError(f"claude CLI error: {str(data.get('result'))[:300]}")
+        return data.get("result", "")
+
+    # -- Anthropic Claude API -----------------------------------------------
+
+    def _chat_anthropic(self, messages: list[dict], max_tokens: int) -> str:
+        """Call Claude via the official Anthropic SDK.
+
+        System messages are moved to the top-level `system` field. Temperature
+        is not sent: current Claude models reject sampling parameters. The SDK
+        retries 429/5xx and connection errors itself.
+        """
+        if self._anthropic is None:
+            try:
+                import anthropic
+            except ImportError as e:
+                raise RuntimeError(
+                    "ANTHROPIC_API_KEY is set but the Anthropic SDK is not installed. "
+                    "Run: pip install anthropic"
+                ) from e
+            timeout = os.environ.get("LLM_TIMEOUT")
+            self._anthropic = anthropic.Anthropic(
+                api_key=self.api_key,
+                max_retries=_MAX_RETRIES,
+                **({"timeout": float(timeout)} if timeout else {}),
+            )
+
+        system = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
+        convo = [
+            {"role": m["role"], "content": m["content"]}
+            for m in messages if m["role"] in ("user", "assistant")
+        ]
+        kwargs: dict = {
+            "model": self.model,
+            "max_tokens": max(max_tokens, _ANTHROPIC_MIN_MAX_TOKENS),
+            "messages": convo,
+        }
+        if system:
+            kwargs["system"] = system
+
+        if self.model in _ANTHROPIC_FALLBACK_MODELS:
+            # If a safety classifier declines, re-run on another model in the same call.
+            response = self._anthropic.beta.messages.create(
+                betas=["server-side-fallback-2026-06-01"],
+                fallbacks=[{"model": "claude-opus-4-8"}],
+                **kwargs,
+            )
+        else:
+            response = self._anthropic.messages.create(**kwargs)
+
+        if response.stop_reason == "refusal":
+            raise RuntimeError(f"Claude declined the request (model {self.model})")
+        return "".join(b.text for b in response.content if b.type == "text")
 
     # -- Native Gemini API --------------------------------------------------
 
@@ -198,6 +363,11 @@ class LLMClient:
             first = messages[0]
             if first.get("role") == "user" and not first["content"].startswith("/no_think"):
                 messages = [{"role": first["role"], "content": f"/no_think\n{first['content']}"}] + messages[1:]
+
+        if self._is_claude_code:
+            return self._chat_claude_code(messages)
+        if self._is_anthropic:
+            return self._chat_anthropic(messages, max_tokens)
 
         for attempt in range(_MAX_RETRIES):
             try:

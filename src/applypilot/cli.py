@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 import typer
@@ -143,11 +144,75 @@ def run(
 
 
 @app.command()
+def add(
+    sources: Optional[list[str]] = typer.Argument(
+        None, help="Job URLs, or text files containing job links (one or many per line).",
+    ),
+    from_gmail: Optional[str] = typer.Option(
+        None, "--from-gmail",
+        help="Read job links from emails sent by this address (needs GMAIL_ADDRESS + GMAIL_APP_PASSWORD).",
+    ),
+    days: int = typer.Option(60, "--days", help="With --from-gmail: how far back to look."),
+    rescan: bool = typer.Option(False, "--rescan", help="With --from-gmail: re-read emails processed before."),
+) -> None:
+    """Add hand-picked job links. They are always tailored and applied to, whatever their score."""
+    _bootstrap()
+
+    from pathlib import Path
+
+    from applypilot.database import add_hand_picked, get_connection, store_jobs
+    from applypilot.intake import extract_job_urls, fetch_gmail_job_urls, mark_gmail_seen
+
+    if not sources and not from_gmail:
+        console.print("[red]Give job URLs, a text file of links, or --from-gmail ADDRESS.[/red]")
+        raise typer.Exit(code=1)
+
+    conn = get_connection()
+    total_new = total_known = 0
+
+    for src in sources or []:
+        path = Path(src)
+        text = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else src
+        urls = extract_job_urls(text)
+        if not urls:
+            console.print(f"[yellow]No job links found in:[/yellow] {src}")
+            continue
+        new, known = add_hand_picked(conn, urls, source="manual")
+        total_new += new
+        total_known += known
+
+    if from_gmail:
+        try:
+            picks, others, email_keys = fetch_gmail_job_urls(from_gmail, days=days, include_seen=rescan)
+        except RuntimeError as e:
+            console.print(f"[red]{e}[/red]")
+            raise typer.Exit(code=1)
+        if picks:
+            new, known = add_hand_picked(conn, picks, source=f"gmail:{from_gmail}")
+            total_new += new
+            total_known += known
+        if others:
+            # "Similar jobs" in the same emails: normal jobs, kept only if they score well
+            extra_new, _ = store_jobs(conn, [{"url": u} for u in others],
+                                      site="manual", strategy=f"gmail-suggested:{from_gmail}")
+            console.print(f"Also added {extra_new} suggested job(s) from those emails "
+                          "(applied to only if they score 7+).")
+        mark_gmail_seen(email_keys)
+        console.print(f"Read {len(email_keys)} email(s) from {from_gmail}: "
+                      f"{len(picks)} picked job(s), {len(others)} suggested.")
+
+    console.print(f"[green]Added {total_new} new job(s)[/green]; "
+                  f"{total_known} were already in the database (now marked hand-picked).")
+    if total_new or total_known:
+        console.print("Next: [bold]applypilot run enrich score tailor[/bold], then [bold]applypilot apply[/bold].")
+
+
+@app.command()
 def apply(
     limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers."),
     min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for job selection."),
-    model: str = typer.Option("haiku", "--model", "-m", help="Claude model name."),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Apply model (defaults from APPLY_MODEL/LLM_MODEL)."),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
@@ -186,7 +251,7 @@ def apply(
 
     # --- Full apply mode ---
 
-    # Check 1: Tier 3 required (Claude Code CLI + Chrome)
+    # Check 1: Tier 3 required (Claude Code CLI or Ollama + Chrome)
     check_tier(3, "auto-apply")
 
     # Check 2: Profile exists
@@ -210,13 +275,18 @@ def apply(
             )
             raise typer.Exit(code=1)
 
+    effective_model = model or os.environ.get(
+        "APPLY_MODEL",
+        os.environ.get("LLM_MODEL", os.environ.get("OLLAMA_MODEL", "haiku")),
+    )
+
     if gen:
         from applypilot.apply.launcher import gen_prompt, BASE_CDP_PORT
         target = url or ""
         if not target:
             console.print("[red]--gen requires --url to specify which job.[/red]")
             raise typer.Exit(code=1)
-        prompt_file = gen_prompt(target, min_score=min_score, model=model)
+        prompt_file = gen_prompt(target, min_score=min_score, model=effective_model)
         if not prompt_file:
             console.print("[red]No matching job found for that URL.[/red]")
             raise typer.Exit(code=1)
@@ -224,7 +294,7 @@ def apply(
         console.print(f"[green]Wrote prompt to:[/green] {prompt_file}")
         console.print(f"\n[bold]Run manually:[/bold]")
         console.print(
-            f"  claude --model {model} -p "
+            f"  claude --model {effective_model} -p "
             f"--mcp-config {mcp_path} "
             f"--permission-mode bypassPermissions < {prompt_file}"
         )
@@ -237,7 +307,7 @@ def apply(
     console.print("\n[bold blue]Launching Auto-Apply[/bold blue]")
     console.print(f"  Limit:    {'unlimited' if continuous else effective_limit}")
     console.print(f"  Workers:  {workers}")
-    console.print(f"  Model:    {model}")
+    console.print(f"  Model:    {effective_model}")
     console.print(f"  Headless: {headless}")
     console.print(f"  Dry run:  {dry_run}")
     if url:
@@ -249,7 +319,7 @@ def apply(
         target_url=url,
         min_score=min_score,
         headless=headless,
-        model=model,
+        model=effective_model,
         dry_run=dry_run,
         continuous=continuous,
         workers=workers,
@@ -382,7 +452,11 @@ def doctor() -> None:
     import os
     has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
     has_openai = bool(os.environ.get("OPENAI_API_KEY"))
-    has_local = bool(os.environ.get("LLM_URL"))
+    has_local = bool(
+        os.environ.get("LLM_URL")
+        or os.environ.get("LLM_PROVIDER", "").lower() == "ollama"
+        or os.environ.get("OLLAMA_MODEL")
+    )
     if has_gemini:
         model = os.environ.get("LLM_MODEL", "gemini-2.0-flash")
         results.append(("LLM API key", ok_mark, f"Gemini ({model})"))
@@ -390,19 +464,28 @@ def doctor() -> None:
         model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
         results.append(("LLM API key", ok_mark, f"OpenAI ({model})"))
     elif has_local:
-        results.append(("LLM API key", ok_mark, f"Local: {os.environ.get('LLM_URL')}"))
+        results.append((
+            "LLM API key", ok_mark,
+            f"Local: {os.environ.get('LLM_URL') or 'http://127.0.0.1:11434/v1'}",
+        ))
     else:
         results.append(("LLM API key", fail_mark,
                         "Set GEMINI_API_KEY in ~/.applypilot/.env (run 'applypilot init')"))
 
     # --- Tier 3 checks ---
-    # Claude Code CLI
+    # Browser agent
     claude_bin = shutil.which("claude")
+    ollama_bin = shutil.which("ollama")
     if claude_bin:
         results.append(("Claude Code CLI", ok_mark, claude_bin))
     else:
         results.append(("Claude Code CLI", fail_mark,
-                        "Install from https://claude.ai/code (needed for auto-apply)"))
+                        "Not installed (use Ollama or install from https://claude.ai/code)"))
+    if ollama_bin:
+        results.append(("Ollama", ok_mark, ollama_bin))
+    else:
+        results.append(("Ollama", "[dim]optional[/dim]",
+                        "Install from https://ollama.com for local auto-apply"))
 
     # Chrome
     try:
@@ -446,9 +529,9 @@ def doctor() -> None:
 
     if tier == 1:
         console.print("[dim]  → Tier 2 unlocks: scoring, tailoring, cover letters (needs LLM API key)[/dim]")
-        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
+        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI or Ollama + Chrome + Node.js)[/dim]")
     elif tier == 2:
-        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
+        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI or Ollama + Chrome + Node.js)[/dim]")
 
     console.print()
 

@@ -267,9 +267,12 @@ def extract_from_json_ld(intel: dict) -> dict | None:
         if not apply_url:
             apply_url = posting.get("url")
 
+        org = posting.get("hiringOrganization")
         return {
             "full_description": desc_clean,
             "application_url": apply_url,
+            "title": posting.get("title"),
+            "company": org.get("name") if isinstance(org, dict) else None,
         }
 
     return None
@@ -473,6 +476,9 @@ def extract_with_llm(page, url: str) -> dict:
         result = extract_json(raw)
         desc = result.get("full_description")
         apply_url = result.get("application_url")
+        # The LLM sometimes writes the string "None"/"null" instead of JSON null
+        if not isinstance(apply_url, str) or not apply_url.startswith("http"):
+            apply_url = None
 
         if desc:
             desc = clean_description(desc)
@@ -528,6 +534,43 @@ RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
 PERMANENT_FAILURES = {404, 410, 451}
 
 
+_LINKEDIN_JOB_RE = re.compile(r"linkedin\.com/jobs/view/(?:[^/?]*-)?(\d+)")
+
+
+def _scrape_linkedin_guest(page, url: str, job_id: str) -> dict:
+    """LinkedIn job pages show a sign-in wall to headless browsers; the public
+    guest endpoint (also used by JobSpy) returns the full posting."""
+    result: dict = {"full_description": None, "application_url": url,
+                    "status": "error", "tier_used": 1, "error": None}
+    resp = page.goto(f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{job_id}",
+                     timeout=45000)
+    if resp and resp.status != 200:
+        result["error"] = f"HTTP {resp.status}"
+        return result
+    soup = BeautifulSoup(page.content(), "html.parser")
+
+    def text(sel: str) -> str | None:
+        el = soup.select_one(sel)
+        return el.get_text(" ", strip=True) if el else None
+
+    result["title"] = text(".top-card-layout__title, h2.topcard__title")
+    result["company"] = text("a.topcard__org-name-link")
+    desc = soup.select_one(".show-more-less-html__markup, .description__text")
+    if desc:
+        result["full_description"] = clean_description(str(desc))
+    # Off-site "Apply" link is embedded as a quoted URL inside an HTML comment
+    apply_code = soup.select_one("code#applyUrl")
+    if apply_code:
+        m = re.search(r'"(https?://[^"]+)"', apply_code.decode_contents())
+        if m:
+            result["application_url"] = m.group(1)
+    if result["full_description"]:
+        result["status"] = "ok"
+    else:
+        result["error"] = "no description on LinkedIn guest page"
+    return result
+
+
 def scrape_detail_page(page, url: str) -> dict:
     """Full cascade for one detail page."""
     result: dict = {
@@ -538,6 +581,15 @@ def scrape_detail_page(page, url: str) -> dict:
         "error": None,
     }
     t0 = time.time()
+
+    li = _LINKEDIN_JOB_RE.search(url)
+    if li:
+        try:
+            result = _scrape_linkedin_guest(page, url, li.group(1))
+        except Exception as e:
+            result["error"] = str(e)[:200]
+        result["elapsed"] = time.time() - t0
+        return result
 
     try:
         resp = page.goto(url, timeout=45000)
@@ -561,10 +613,17 @@ def scrape_detail_page(page, url: str) -> dict:
 
     intel = collect_detail_intelligence(page)
 
+    # Page title as a fallback job title (hand-added jobs arrive without one)
+    try:
+        result["title"] = page.title().strip() or None
+    except Exception:
+        pass
+
     # Tier 1: JSON-LD
     json_ld_result = extract_from_json_ld(intel)
     if json_ld_result and json_ld_result.get("full_description"):
-        result.update(json_ld_result)
+        # Skip empty values so a missing JSON-LD title keeps the page title
+        result.update({k: v for k, v in json_ld_result.items() if v})
         result["tier_used"] = 1
         if not result.get("application_url"):
             apply = extract_apply_url_deterministic(page)
@@ -663,10 +722,17 @@ def scrape_site_batch(
 
                 if status in ("ok", "partial"):
                     stats[status] += 1
+                    # Title/company only fill gaps: hand-added jobs have no
+                    # title and site="manual" until now.
+                    company = result.get("company")
                     conn.execute(
                         "UPDATE jobs SET full_description = ?, application_url = ?, "
-                        "detail_scraped_at = ?, detail_error = NULL WHERE url = ?",
-                        (result.get("full_description"), result.get("application_url"), now, url),
+                        "detail_scraped_at = ?, detail_error = NULL, "
+                        "title = COALESCE(title, ?, url), "
+                        "site = CASE WHEN site = 'manual' AND ? IS NOT NULL THEN ? ELSE site END "
+                        "WHERE url = ?",
+                        (result.get("full_description"), result.get("application_url"), now,
+                         result.get("title"), company, company, url),
                     )
                 else:
                     stats["error"] += 1

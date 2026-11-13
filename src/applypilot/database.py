@@ -153,6 +153,8 @@ _ALL_COLUMNS: dict[str, str] = {
     "site": "TEXT",
     "strategy": "TEXT",
     "discovered_at": "TEXT",
+    # 1 = added by hand (`applypilot add`): tailored and applied regardless of fit_score
+    "hand_picked": "INTEGER DEFAULT 0",
     # Enrichment
     "full_description": "TEXT",
     "application_url": "TEXT",
@@ -362,6 +364,40 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
     return new, existing
 
 
+def add_hand_picked(conn: sqlite3.Connection, urls: list[str],
+                    source: str) -> tuple[int, int]:
+    """Add job URLs chosen by hand. They skip the fit_score cutoff.
+
+    New URLs are inserted with site="manual" (enrichment fills in title and
+    company). URLs already in the database are flagged hand-picked so they
+    become eligible even if they scored low.
+
+    Args:
+        conn: Database connection.
+        urls: Job page URLs.
+        source: Where the links came from (stored in the strategy column).
+
+    Returns:
+        Tuple of (new_count, already_known_count).
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    new = 0
+    existing = 0
+    for url in urls:
+        try:
+            conn.execute(
+                "INSERT INTO jobs (url, site, strategy, discovered_at, hand_picked) "
+                "VALUES (?, 'manual', ?, ?, 1)",
+                (url, source, now),
+            )
+            new += 1
+        except sqlite3.IntegrityError:
+            conn.execute("UPDATE jobs SET hand_picked = 1 WHERE url = ?", (url,))
+            existing += 1
+    conn.commit()
+    return new, existing
+
+
 def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
                       stage: str = "discovered",
                       min_score: int | None = None,
@@ -387,7 +423,7 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         "pending_score": "full_description IS NOT NULL AND fit_score IS NULL",
         "scored": "fit_score IS NOT NULL",
         "pending_tailor": (
-            "fit_score >= ? AND full_description IS NOT NULL "
+            "(fit_score >= ? OR hand_picked = 1) AND full_description IS NOT NULL "
             "AND tailored_resume_path IS NULL AND COALESCE(tailor_attempts, 0) < 5"
         ),
         "tailored": "tailored_resume_path IS NOT NULL",
@@ -410,7 +446,10 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         where += " AND fit_score >= ?"
         params.append(min_score)
 
-    query = f"SELECT * FROM jobs WHERE {where} ORDER BY fit_score DESC NULLS LAST, discovered_at DESC"
+    query = (
+        f"SELECT * FROM jobs WHERE {where} "
+        "ORDER BY COALESCE(hand_picked, 0) DESC, fit_score DESC NULLS LAST, discovered_at DESC"
+    )
     if limit > 0:
         query += " LIMIT ?"
         params.append(limit)

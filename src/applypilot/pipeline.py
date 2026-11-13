@@ -224,7 +224,7 @@ _PENDING_SQL: dict[str, str] = {
     "enrich": "SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL",
     "score":  "SELECT COUNT(*) FROM jobs WHERE full_description IS NOT NULL AND fit_score IS NULL",
     "tailor": (
-        "SELECT COUNT(*) FROM jobs WHERE fit_score >= ? "
+        "SELECT COUNT(*) FROM jobs WHERE (fit_score >= ? OR hand_picked = 1) "
         "AND full_description IS NOT NULL "
         "AND tailored_resume_path IS NULL "
         "AND COALESCE(tailor_attempts, 0) < 5"

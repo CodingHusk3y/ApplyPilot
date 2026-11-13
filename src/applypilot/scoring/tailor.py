@@ -220,6 +220,23 @@ def extract_json(raw: str) -> dict:
 
 # ── Resume Assembly (profile-driven header) ──────────────────────────────
 
+def _append_entry(lines: list[str], entry: object) -> None:
+    """Append one experience/project entry, tolerating loosely-shaped LLM output."""
+    if not isinstance(entry, dict):
+        lines.append(sanitize_text(entry))
+        lines.append("")
+        return
+    lines.append(sanitize_text(entry.get("header", "")))
+    if entry.get("subtitle"):
+        lines.append(sanitize_text(entry["subtitle"]))
+    bullets = entry.get("bullets", [])
+    if isinstance(bullets, str):
+        bullets = [bullets]
+    for b in bullets:
+        lines.append(f"- {sanitize_text(b)}")
+    lines.append("")
+
+
 def assemble_resume_text(data: dict, profile: dict) -> str:
     """Convert JSON resume data to formatted plain text.
 
@@ -267,32 +284,28 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
     lines.append("TECHNICAL SKILLS")
     if isinstance(data["skills"], dict):
         for cat, val in data["skills"].items():
-            lines.append(f"{cat}: {sanitize_text(str(val))}")
+            if isinstance(val, list):
+                val = ", ".join(sanitize_text(v) for v in val)
+            lines.append(f"{cat}: {sanitize_text(val)}")
     lines.append("")
 
     # Experience
     lines.append("EXPERIENCE")
     for entry in data.get("experience", []):
-        lines.append(sanitize_text(entry.get("header", "")))
-        if entry.get("subtitle"):
-            lines.append(sanitize_text(entry["subtitle"]))
-        for b in entry.get("bullets", []):
-            lines.append(f"- {sanitize_text(b)}")
-        lines.append("")
+        _append_entry(lines, entry)
 
     # Projects
     lines.append("PROJECTS")
     for entry in data.get("projects", []):
-        lines.append(sanitize_text(entry.get("header", "")))
-        if entry.get("subtitle"):
-            lines.append(sanitize_text(entry["subtitle"]))
-        for b in entry.get("bullets", []):
-            lines.append(f"- {sanitize_text(b)}")
-        lines.append("")
+        _append_entry(lines, entry)
 
     # Education
     lines.append("EDUCATION")
-    lines.append(sanitize_text(str(data.get("education", ""))))
+    education = data.get("education", "")
+    if isinstance(education, list):
+        lines.extend(sanitize_text(e) for e in education)
+    else:
+        lines.append(sanitize_text(education))
 
     return "\n".join(lines)
 
@@ -544,6 +557,21 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
         results.append(result)
         stats[result.get("status", "error")] = stats.get(result.get("status", "error"), 0) + 1
 
+        # Persist immediately: increment attempt counter for all, save path only
+        # for approved. Lets apply pick it up right away and survives interrupts.
+        if result["status"] in ("approved", "approved_with_judge_warning"):
+            conn.execute(
+                "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "
+                "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
+                (result["path"], datetime.now(timezone.utc).isoformat(), result["url"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
+                (result["url"],),
+            )
+        conn.commit()
+
         elapsed = time.time() - t0
         rate = completed / elapsed if elapsed > 0 else 0
         log.info(
@@ -554,23 +582,6 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             rate * 60,
             result["title"][:40],
         )
-
-    # Persist to DB: increment attempt counter for ALL, save path only for approved
-    now = datetime.now(timezone.utc).isoformat()
-    _success_statuses = {"approved", "approved_with_judge_warning"}
-    for r in results:
-        if r["status"] in _success_statuses:
-            conn.execute(
-                "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "
-                "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
-                (r["path"], now, r["url"]),
-            )
-        else:
-            conn.execute(
-                "UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
-                (r["url"],),
-            )
-    conn.commit()
 
     elapsed = time.time() - t0
     log.info(

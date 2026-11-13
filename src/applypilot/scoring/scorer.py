@@ -147,19 +147,19 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
 
         results.append(result)
 
+        # Write each score immediately so downstream stages (and other
+        # terminals) can pick it up, and an interrupted run keeps its progress.
+        conn.execute(
+            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
+            (result["score"], f"{result['keywords']}\n{result['reasoning']}",
+             datetime.now(timezone.utc).isoformat(), result["url"]),
+        )
+        conn.commit()
+
         log.info(
             "[%d/%d] score=%d  %s",
             completed, len(jobs), result["score"], job.get("title", "?")[:60],
         )
-
-    # Write scores to DB
-    now = datetime.now(timezone.utc).isoformat()
-    for r in results:
-        conn.execute(
-            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
-            (r["score"], f"{r['keywords']}\n{r['reasoning']}", now, r["url"]),
-        )
-    conn.commit()
 
     elapsed = time.time() - t0
     log.info("Done: %d scored in %.1fs (%.1f jobs/sec)", len(results), elapsed, len(results) / elapsed if elapsed > 0 else 0)

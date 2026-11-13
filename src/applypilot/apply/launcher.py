@@ -1,4 +1,4 @@
-"""Apply orchestration: acquire jobs, spawn Claude Code sessions, track results.
+"""Apply orchestration: acquire jobs, spawn browser-agent sessions, track results.
 
 This is the main entry point for the apply pipeline. It pulls jobs from
 the database, launches Chrome + Claude Code for each one, parses the
@@ -134,10 +134,10 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 WHERE tailored_resume_path IS NOT NULL
                   AND (apply_status IS NULL OR apply_status = 'failed')
                   AND (apply_attempts IS NULL OR apply_attempts < ?)
-                  AND fit_score >= ?
+                  AND (fit_score >= ? OR hand_picked = 1)
                   {site_clause}
                   {url_clauses}
-                ORDER BY fit_score DESC, url
+                ORDER BY COALESCE(hand_picked, 0) DESC, fit_score DESC, url
                 LIMIT 1
             """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
 
@@ -294,9 +294,82 @@ def reset_failed() -> int:
 # Per-job execution
 # ---------------------------------------------------------------------------
 
+_LINKEDIN_JOB_ID = re.compile(r"linkedin\.com/jobs/view/(?:[^/?]*-)?(\d+)")
+_LINKEDIN_COMPANY: dict[str, str | None] = {}  # job id -> company name, filled by linkedin_apply_info
+
+
+def linkedin_apply_info(job_id: str) -> tuple[str, str | None]:
+    """How a LinkedIn job is applied to, from LinkedIn's public guest page.
+
+    Returns (kind, url):
+      ("offsite", url)       company apply link found
+      ("offsite_hidden", None) applies on the company site, but LinkedIn hides
+                               the link from signed-out visitors
+      ("easy_apply", None)   LinkedIn Easy Apply only (needs a LinkedIn login)
+      ("unknown", None)      page layout not recognized
+    Raises on network/HTTP errors.
+    """
+    import httpx
+    from urllib.parse import parse_qs, unquote, urlparse
+
+    resp = httpx.get(
+        f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{job_id}",
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"},
+        timeout=20, follow_redirects=True,
+    )
+    resp.raise_for_status()
+    html = resp.text
+    org = re.search(r'class="topcard__org-name-link[^"]*"[^>]*>\s*([^<]+?)\s*<', html)
+    _LINKEDIN_COMPANY[job_id] = org.group(1).strip() if org else None
+    m = re.search(r'<code id="applyUrl"[^>]*>\s*<!--\s*"([^"]+)"', html)
+    if m:
+        url = m.group(1).replace("&amp;", "&")
+        # LinkedIn wraps it in an externalApply redirect: the real URL is in ?url=
+        target = parse_qs(urlparse(url).query).get("url")
+        return "offsite", unquote(target[0]) if target else url
+    if "apply-link-offsite" in html or "offsite-apply-icon" in html:
+        return "offsite_hidden", None
+    # "apply-link-onsite" / "apply-link-simple_onsite" = LinkedIn Easy Apply
+    if re.search(r"apply-link-(?:simple_)?onsite", html):
+        return "easy_apply", None
+    return "unknown", None
+
+
+def _resolve_linkedin_job(job: dict) -> bool:
+    """For a LinkedIn job, point application_url at the company's own site.
+
+    Returns False if the job is Easy Apply only. Any lookup error returns True
+    and leaves the job as-is, so the agent still gets a chance.
+    """
+    current = job.get("application_url") or job["url"]
+    m = _LINKEDIN_JOB_ID.search(current)
+    if not m:
+        return True
+    try:
+        kind, offsite = linkedin_apply_info(m.group(1))
+    except Exception as e:
+        logger.info("LinkedIn apply-link lookup failed for %s: %s", job["url"], e)
+        return True
+    if _LINKEDIN_COMPANY.get(m.group(1)):
+        job["company"] = _LINKEDIN_COMPANY[m.group(1)]
+    if kind == "easy_apply":
+        return False
+    if kind != "offsite":
+        # Link hidden or unknown: the prompt tells the agent to find this
+        # posting on the company's own careers site.
+        job["linkedin_offsite_hidden"] = True
+        return True
+    job["application_url"] = offsite
+    conn = get_connection()
+    conn.execute("UPDATE jobs SET application_url = ? WHERE url = ?", (offsite, job["url"]))
+    conn.commit()
+    return True
+
+
 def run_job(job: dict, port: int, worker_id: int = 0,
             model: str = "sonnet", dry_run: bool = False) -> tuple[str, int]:
-    """Spawn a Claude Code session for one job application.
+    """Spawn a browser-agent session for one job application.
 
     Returns:
         Tuple of (status_string, duration_ms). Status is one of:
@@ -321,27 +394,47 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     mcp_config_path = config.APP_DIR / f".mcp-apply-{worker_id}.json"
     mcp_config_path.write_text(json.dumps(_make_mcp_config(port)), encoding="utf-8")
 
-    # Build claude command
-    cmd = [
-        "claude",
-        "--model", model,
-        "-p",
-        "--mcp-config", str(mcp_config_path),
-        "--permission-mode", "bypassPermissions",
-        "--no-session-persistence",
-        "--disallowedTools", (
-            "mcp__gmail__draft_email,mcp__gmail__modify_email,"
-            "mcp__gmail__delete_email,mcp__gmail__download_attachment,"
-            "mcp__gmail__batch_modify_emails,mcp__gmail__batch_delete_emails,"
-            "mcp__gmail__create_label,mcp__gmail__update_label,"
-            "mcp__gmail__delete_label,mcp__gmail__get_or_create_label,"
-            "mcp__gmail__list_email_labels,mcp__gmail__create_filter,"
-            "mcp__gmail__list_filters,mcp__gmail__get_filter,"
-            "mcp__gmail__delete_filter"
-        ),
-        "--output-format", "stream-json",
-        "--verbose", "-",
-    ]
+    # Long multi-step Workday forms need a stronger model than simple ones.
+    # APPLY_WORKDAY_MODEL (e.g. "sonnet") overrides --model for Workday jobs only.
+    apply_url = (job.get("application_url") or job.get("url") or "").lower()
+    workday_model = os.environ.get("APPLY_WORKDAY_MODEL")
+    if workday_model and "myworkdayjobs.com" in apply_url:
+        model = workday_model
+
+    apply_provider = os.environ.get("APPLY_PROVIDER", "").lower()
+    if apply_provider == "ollama":
+        agent_prompt = (
+            "The browser has already been navigated to the exact application URL. "
+            "Start by inspecting the current page with browser_snapshot; do not "
+            "navigate to Google or search for the job again.\n\n"
+            + agent_prompt
+        )
+        cmd = [
+            sys.executable, "-m", "applypilot.apply.ollama_agent",
+            "--cdp-port", str(port), "--model", model,
+            "--url", job.get("application_url") or job["url"],
+        ]
+    else:
+        cmd = [
+            "claude",
+            "--model", model,
+            "-p",
+            "--mcp-config", str(mcp_config_path),
+            "--permission-mode", "bypassPermissions",
+            "--no-session-persistence",
+            "--disallowedTools", (
+                "mcp__gmail__draft_email,mcp__gmail__modify_email,"
+                "mcp__gmail__delete_email,mcp__gmail__download_attachment,"
+                "mcp__gmail__batch_modify_emails,mcp__gmail__batch_delete_emails,"
+                "mcp__gmail__create_label,mcp__gmail__update_label,"
+                "mcp__gmail__delete_label,mcp__gmail__get_or_create_label,"
+                "mcp__gmail__list_email_labels,mcp__gmail__create_filter,"
+                "mcp__gmail__list_filters,mcp__gmail__get_filter,"
+                "mcp__gmail__delete_filter"
+            ),
+            "--output-format", "stream-json",
+            "--verbose", "-",
+        ]
 
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
@@ -449,11 +542,18 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             return "skipped", int((time.time() - start) * 1000)
 
         output = "\n".join(text_parts)
+        if not output.strip():
+            # Nothing at all from the CLI: record why, so the job log isn't empty
+            agent_name = "Ollama" if apply_provider == "ollama" else "claude"
+            output = (f"({agent_name} exited with code {returncode} and produced no output -- "
+                      "check the agent configuration and local model)")
+            with open(worker_log, "a", encoding="utf-8") as lf:
+                lf.write(output + "\n")
         elapsed = int(time.time() - start)
         duration_ms = int((time.time() - start) * 1000)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        job_log = config.LOG_DIR / f"claude_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
+        job_log = config.LOG_DIR / f"{apply_provider or 'claude'}_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
         job_log.write_text(output, encoding="utf-8")
 
         if stats:
@@ -524,7 +624,7 @@ PERMANENT_FAILURES: set[str] = {
     "not_eligible_location", "not_eligible_salary",
     "already_applied", "account_required",
     "not_a_job_application", "unsafe_permissions",
-    "unsafe_verification", "sso_required",
+    "unsafe_verification", "sso_required", "linkedin_login_required",
     "site_blocked", "cloudflare_blocked", "blocked_by_cloudflare",
 }
 
@@ -557,7 +657,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         target_url: Apply to a specific URL.
         min_score: Minimum fit_score threshold.
         headless: Run Chrome headless.
-        model: Claude model name.
+        model: Browser-agent model name.
         dry_run: Don't click Submit.
 
     Returns:
@@ -592,6 +692,15 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             # Use Event.wait for interruptible sleep
             if _stop_event.wait(timeout=POLL_INTERVAL):
                 break  # Stop was requested during wait
+            continue
+
+        # LinkedIn walls job pages for the agent's browser. Resolve the
+        # company's own apply link up front; Easy Apply-only jobs are skipped
+        # without spending a Claude run.
+        if not _resolve_linkedin_job(job):
+            mark_result(job["url"], "failed", "linkedin_easy_apply_only", permanent=True)
+            add_event(f"[W{worker_id}] LinkedIn Easy Apply only, skipped: {job['title'][:30]}")
+            failed += 1
             continue
 
         empty_polls = 0
@@ -661,7 +770,7 @@ def main(limit: int = 1, target_url: str | None = None,
         target_url: Apply to a specific URL.
         min_score: Minimum fit_score threshold.
         headless: Run Chrome in headless mode.
-        model: Claude model name.
+        model: Browser-agent model name.
         dry_run: Don't click Submit.
         continuous: Run forever, polling for new jobs.
         poll_interval: Seconds between DB polls when queue is empty.

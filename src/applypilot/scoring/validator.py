@@ -85,8 +85,16 @@ def _build_skills_set(profile: dict) -> set[str]:
     return allowed
 
 
-def sanitize_text(text: str) -> str:
+def to_text(value: object) -> str:
+    """Coerce an LLM JSON value to a string (smaller models often return lists)."""
+    if isinstance(value, list):
+        return " ".join(to_text(v) for v in value)
+    return "" if value is None else str(value)
+
+
+def sanitize_text(text: object) -> str:
     """Auto-fix common LLM output issues instead of rejecting."""
+    text = to_text(text)
     text = text.replace(" \u2014 ", ", ").replace("\u2014", ", ")   # em dash -> comma
     text = text.replace("\u2013", "-")    # en dash -> hyphen
     text = text.replace("\u201c", '"').replace("\u201d", '"')   # smart double quotes
@@ -121,7 +129,7 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
         return {"passed": False, "errors": errors, "warnings": warnings}
 
     # Collect all text for bulk checks
-    all_text_parts: list[str] = [data["summary"]]
+    all_text_parts: list[str] = [to_text(data["summary"])]
 
     # Skills: check for fabrication (always enforced)
     if isinstance(data["skills"], dict):
@@ -140,19 +148,19 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
         for company in preserved_companies:
             has_company = any(
                 company.lower() in str(e.get("header", "")).lower()
-                for e in data["experience"]
+                for e in data["experience"] if isinstance(e, dict)
             )
             if not has_company:
                 errors.append(f"Company '{company}' missing from experience")
         for entry in data["experience"]:
-            for b in entry.get("bullets", []):
-                all_text_parts.append(b)
+            if isinstance(entry, dict):
+                all_text_parts.append(to_text(entry.get("bullets", [])))
 
     # Projects: collect bullets
     if isinstance(data["projects"], list):
         for entry in data["projects"]:
-            for b in entry.get("bullets", []):
-                all_text_parts.append(b)
+            if isinstance(entry, dict):
+                all_text_parts.append(to_text(entry.get("bullets", [])))
 
     # Education: preserved school must be present (always enforced)
     preserved_school = resume_facts.get("preserved_school", "")

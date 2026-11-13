@@ -28,12 +28,14 @@ Three commands. That's it.
 
 ```bash
 pip install applypilot
-pip install --no-deps python-jobspy && pip install pydantic tls-client requests markdownify regex
+pip install --no-deps python-jobspy
+pip install pydantic tls-client requests markdownify regex
 applypilot init          # one-time setup: resume, profile, preferences, API keys
 applypilot doctor        # verify your setup — shows what's installed and what's missing
-applypilot run           # discover > enrich > score > tailor > cover letters
+python -m applypilot run           # discover > enrich > score > tailor > cover letters
 applypilot run -w 4      # same but parallel (4 threads for discovery/enrichment)
-applypilot apply         # autonomous browser-driven submission
+python -m applypilot run score tailor
+python -m applypilot apply         # autonomous browser-driven submission
 applypilot apply -w 3    # parallel apply (3 Chrome instances)
 applypilot apply --dry-run  # fill forms without submitting
 ```
@@ -92,9 +94,33 @@ Each stage is independent. Run them all or pick what you need.
 | Node.js 18+ | Auto-apply | Needed for `npx` to run Playwright MCP server |
 | Gemini API key | Scoring, tailoring, cover letters | Free tier (15 RPM / 1M tokens/day) is enough |
 | Chrome/Chromium | Auto-apply | Auto-detected on most systems |
-| Claude Code CLI | Auto-apply | Install from [claude.ai/code](https://claude.ai/code) |
+| Claude Code CLI or Ollama | Auto-apply | Claude Code is the default; Ollama is supported experimentally for local tool calling |
 
 **Gemini API key is free.** Get one at [aistudio.google.com](https://aistudio.google.com). OpenAI and local models (Ollama/llama.cpp) are also supported.
+
+### Local Ollama auto-apply (experimental)
+
+Ollama can replace Claude Code for the browser agent. It must support OpenAI-compatible
+tool calls; `qwen3:14b` is a good starting point for machines with about 10 GB of
+available VRAM/RAM. Larger models are more reliable on long Workday forms.
+
+```bash
+ollama pull qwen3:14b
+```
+
+Add these settings to `~/.applypilot/.env`:
+
+```dotenv
+LLM_PROVIDER=ollama
+LLM_MODEL=qwen3:14b
+APPLY_PROVIDER=ollama
+APPLY_MODEL=qwen3:14b
+LLM_TIMEOUT=600
+```
+
+Run `applypilot doctor`, then use `applypilot apply --dry-run` first. Local browser
+agents are slower and may make more tool-call mistakes than Claude Code, so review
+dry-run behavior before enabling real submissions.
 
 ### Optional
 
@@ -144,7 +170,10 @@ Generates a custom resume per job: reorders experience, emphasizes relevant skil
 Writes a targeted cover letter per job referencing the specific company, role, and how your experience maps to their requirements.
 
 ### Auto-Apply
-Claude Code launches a Chrome instance, navigates to each application page, detects the form type, fills personal information and work history, uploads the tailored resume and cover letter, answers screening questions with AI, and submits. A live dashboard shows progress in real-time.
+Claude Code (or the experimental Ollama runner) launches a Chrome instance, navigates
+to each application page, detects the form type, fills personal information and work
+history, uploads the tailored resume and cover letter, answers screening questions
+with AI, and submits. A live dashboard shows progress in real-time.
 
 The Playwright MCP server is configured automatically at runtime per worker. No manual MCP setup needed.
 

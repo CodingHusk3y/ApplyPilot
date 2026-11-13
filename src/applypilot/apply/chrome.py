@@ -110,24 +110,43 @@ def setup_worker_profile(worker_id: int) -> Path:
     Returns:
         Path to the worker's Chrome user-data directory.
     """
+    wanted = config.get_chrome_profile_name()
     profile_dir = config.CHROME_WORKER_DIR / f"worker-{worker_id}"
     if (profile_dir / "Default").exists():
-        return profile_dir  # Already initialized
+        if _cloned_from(profile_dir) == wanted:
+            return profile_dir  # Already initialized
+        # CHROME_PROFILE changed since this worker was cloned: set the old
+        # clone aside (not deleted) and rebuild from the requested profile.
+        backup = profile_dir.with_name(f"{profile_dir.name}.{_cloned_from(profile_dir)}.bak")
+        logger.info("[worker-%d] CHROME_PROFILE is now '%s'; moving old clone to %s",
+                    worker_id, wanted, backup.name)
+        if backup.exists():
+            shutil.rmtree(backup, ignore_errors=True)
+        profile_dir.rename(backup)
 
-    # Find a source: prefer existing worker (has session cookies), else user profile
+    # Find a source: prefer existing worker cloned from the same profile (has
+    # session cookies), else the user's real Chrome profile
     source: Path | None = None
+    from_user_data = False
     for wid in range(10):
         if wid == worker_id:
             continue
         candidate = config.CHROME_WORKER_DIR / f"worker-{wid}"
-        if (candidate / "Default").exists():
+        if (candidate / "Default").exists() and _cloned_from(candidate) == wanted:
             source = candidate
             break
     if source is None:
-        source = config.get_chrome_user_data()
+        user_data = config.get_chrome_user_data()
+        if not (user_data / wanted).is_dir():
+            raise FileNotFoundError(
+                f"Chrome profile folder '{wanted}' not found in {user_data}. "
+                "Check CHROME_PROFILE (see chrome://version -> Profile Path)."
+            )
+        source = user_data
+        from_user_data = True
 
-    logger.info("[worker-%d] Copying Chrome profile from %s (first time setup)...",
-                worker_id, source.name)
+    logger.info("[worker-%d] Copying Chrome profile '%s' from %s (first time setup)...",
+                worker_id, wanted, source.name)
     profile_dir.mkdir(parents=True, exist_ok=True)
 
     # Copy essential profile dirs -- skip caches and heavy transient data
@@ -143,6 +162,12 @@ def setup_worker_profile(worker_id: int) -> Path:
         if item.name in skip:
             continue
         dst = profile_dir / item.name
+        if from_user_data and item.is_dir() and (item / "Preferences").exists():
+            # A profile folder: keep only the requested one, cloned as
+            # "Default" (the worker always launches --profile-directory=Default).
+            if item.name != wanted:
+                continue
+            dst = profile_dir / "Default"
         try:
             if item.is_dir():
                 shutil.copytree(
@@ -156,7 +181,24 @@ def setup_worker_profile(worker_id: int) -> Path:
         except (PermissionError, OSError):
             pass  # skip locked files
 
+    (profile_dir / _CLONED_FROM_FILE).write_text(wanted, encoding="utf-8")
     return profile_dir
+
+
+# Records which Chrome profile a worker dir was cloned from.
+_CLONED_FROM_FILE = "applypilot_source_profile.txt"
+
+
+def _cloned_from(profile_dir: Path) -> str:
+    """Return the Chrome profile a worker dir was cloned from.
+
+    Worker dirs made before CHROME_PROFILE existed have no marker; they were
+    always cloned from "Default".
+    """
+    marker = profile_dir / _CLONED_FROM_FILE
+    if marker.exists():
+        return marker.read_text(encoding="utf-8").strip()
+    return "Default"
 
 
 def _suppress_restore_nag(profile_dir: Path) -> None:
@@ -180,6 +222,40 @@ def _suppress_restore_nag(profile_dir: Path) -> None:
         prefs_file.write_text(json.dumps(prefs), encoding="utf-8")
     except Exception:
         logger.debug("Could not patch Chrome preferences", exc_info=True)
+
+
+def _apply_profile_identity(profile_dir: Path) -> None:
+    """Label the worker's "Default" profile as the Chrome profile it was cloned from.
+
+    Profile names, avatars and signed-in account info live in the shared
+    "Local State" file, keyed by folder name. A clone of e.g. "Profile 4"
+    launched as "Default" would otherwise show the user's real Default
+    profile's name and account.
+    """
+    source = _cloned_from(profile_dir)
+    if source == "Default":
+        return
+    state_file = profile_dir / "Local State"
+    if not state_file.exists():
+        return
+    try:
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        cache = state.setdefault("profile", {}).setdefault("info_cache", {})
+        entry = cache.get(source)
+        if entry is None:
+            return  # already patched (source key removed) or unknown
+        state["profile"]["info_cache"] = {"Default": entry}
+        state["profile"]["last_used"] = "Default"
+        state["profile"]["last_active_profiles"] = ["Default"]
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+
+        prefs_file = profile_dir / "Default" / "Preferences"
+        if prefs_file.exists() and entry.get("name"):
+            prefs = json.loads(prefs_file.read_text(encoding="utf-8"))
+            prefs.setdefault("profile", {})["name"] = entry["name"]
+            prefs_file.write_text(json.dumps(prefs), encoding="utf-8")
+    except Exception:
+        logger.debug("Could not patch profile identity", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +284,7 @@ def launch_chrome(worker_id: int, port: int | None = None,
 
     # Patch preferences to suppress restore nag
     _suppress_restore_nag(profile_dir)
+    _apply_profile_identity(profile_dir)
 
     chrome_exe = config.get_chrome_path()
 

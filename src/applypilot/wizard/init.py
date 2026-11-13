@@ -280,25 +280,31 @@ def _setup_ai_features() -> None:
 # ---------------------------------------------------------------------------
 
 def _setup_auto_apply() -> None:
-    """Configure autonomous job application (requires Claude Code CLI)."""
+    """Configure autonomous job application (Claude Code or Ollama)."""
     console.print(Panel(
         "[bold]Step 5: Auto-Apply (optional)[/bold]\n"
         "ApplyPilot can autonomously fill and submit job applications\n"
-        "using Claude Code as the browser agent."
+        "using Claude Code or a local Ollama model as the browser agent."
     ))
 
     if not Confirm.ask("Enable autonomous job applications?", default=True):
         console.print("[dim]You can apply manually using the tailored resumes ApplyPilot generates.[/dim]")
         return
 
-    # Check for Claude Code CLI
+    # Check for Claude Code CLI or Ollama
     if shutil.which("claude"):
         console.print("[green]Claude Code CLI detected.[/green]")
+    elif shutil.which("ollama"):
+        console.print("[green]Ollama detected.[/green]")
+        console.print(
+            "Set APPLY_PROVIDER=ollama and APPLY_MODEL to a tool-capable model "
+            "such as qwen3:14b in ~/.applypilot/.env."
+        )
     else:
         console.print(
-            "[yellow]Claude Code CLI not found on PATH.[/yellow]\n"
-            "Install it from: [bold]https://claude.ai/code[/bold]\n"
-            "Auto-apply won't work until Claude Code is installed."
+            "[yellow]Neither Claude Code CLI nor Ollama was found on PATH.[/yellow]\n"
+            "Install Claude from [bold]https://claude.ai/code[/bold] or Ollama from "
+            "[bold]https://ollama.com[/bold]."
         )
 
     # Optional: CapSolver for CAPTCHAs
