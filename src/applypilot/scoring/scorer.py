@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from applypilot.config import RESUME_PATH, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
+from applypilot import telemetry
 
 log = logging.getLogger(__name__)
 
@@ -92,13 +93,31 @@ def score_job(resume_text: str, job: dict) -> dict:
         {"role": "user", "content": f"RESUME:\n{resume_text}\n\n---\n\nJOB POSTING:\n{job_text}"},
     ]
 
-    try:
-        client = get_client()
-        response = client.chat(messages, max_tokens=512, temperature=0.2)
-        return _parse_score_response(response)
-    except Exception as e:
-        log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e)
-        return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}"}
+    t0 = time.perf_counter()
+    with telemetry.context(stage="score", job_url=job.get("url"),
+                           job_title=(job.get("title") or "")[:80]):
+        try:
+            client = get_client()
+            response = client.chat(messages, max_tokens=512, temperature=0.2)
+        except Exception as e:
+            log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e)
+            telemetry.record(
+                "job_scored", status="error", score=0, parse_ok=False,
+                duration_ms=round((time.perf_counter() - t0) * 1000),
+                error=f"{type(e).__name__}: {str(e)[:300]}",
+            )
+            return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}"}
+
+        result = _parse_score_response(response)
+        parse_ok = result["score"] > 0
+        telemetry.record(
+            "job_scored", status="ok" if parse_ok else "error",
+            score=result["score"], parse_ok=parse_ok,
+            keywords_chars=len(result["keywords"]), reasoning_chars=len(result["reasoning"]),
+            duration_ms=round((time.perf_counter() - t0) * 1000),
+            **({} if parse_ok else {"error": f"unparseable response: {response[:120]!r}"}),
+        )
+        return result
 
 
 def run_scoring(limit: int = 0, rescore: bool = False) -> dict:

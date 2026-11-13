@@ -20,6 +20,8 @@ import time
 
 import httpx
 
+from applypilot import telemetry
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -118,6 +120,21 @@ _ANTHROPIC_MIN_MAX_TOKENS = 16000
 _ANTHROPIC_FALLBACK_MODELS = {"claude-opus-5-5", "claude-opus-5", "claude-fable-5-1"}
 
 
+def _provider_label(base_url: str) -> str:
+    """Short provider name for log records."""
+    if base_url == _CLAUDE_CODE_PROVIDER:
+        return "claude-code"
+    if base_url == _ANTHROPIC_PROVIDER:
+        return "anthropic"
+    if base_url.startswith(_GEMINI_COMPAT_BASE):
+        return "gemini"
+    if "api.openai.com" in base_url:
+        return "openai"
+    if "11434" in base_url:
+        return "ollama"
+    return "local"
+
+
 class LLMClient:
     """Thin LLM client supporting OpenAI-compatible and native Gemini endpoints.
 
@@ -139,10 +156,11 @@ class LLMClient:
         self._is_anthropic: bool = base_url == _ANTHROPIC_PROVIDER
         self._anthropic = None  # created lazily so the SDK stays optional
         self._is_claude_code: bool = base_url == _CLAUDE_CODE_PROVIDER
+        self.provider: str = _provider_label(base_url)
 
     # -- Claude Code CLI ----------------------------------------------------
 
-    def _chat_claude_code(self, messages: list[dict]) -> str:
+    def _chat_claude_code(self, messages: list[dict]) -> tuple[str, dict]:
         """Run one prompt through `claude -p` with all tools disabled.
 
         Uses whatever account the CLI is logged into, so it works with a
@@ -205,11 +223,21 @@ class LLMClient:
             )
         if data.get("is_error"):
             raise RuntimeError(f"claude CLI error: {str(data.get('result'))[:300]}")
-        return data.get("result", "")
+        u = data.get("usage") or {}
+        usage = {
+            "input_tokens": u.get("input_tokens"),
+            "output_tokens": u.get("output_tokens"),
+            "cache_read_tokens": u.get("cache_read_input_tokens"),
+            "cache_write_tokens": u.get("cache_creation_input_tokens"),
+            # Reported by the CLI itself, so this is a measured number.
+            "cost_usd": data.get("total_cost_usd"),
+            "provider_duration_ms": data.get("duration_api_ms"),
+        }
+        return data.get("result", ""), usage
 
     # -- Anthropic Claude API -----------------------------------------------
 
-    def _chat_anthropic(self, messages: list[dict], max_tokens: int) -> str:
+    def _chat_anthropic(self, messages: list[dict], max_tokens: int) -> tuple[str, dict]:
         """Call Claude via the official Anthropic SDK.
 
         System messages are moved to the top-level `system` field. Temperature
@@ -256,7 +284,14 @@ class LLMClient:
 
         if response.stop_reason == "refusal":
             raise RuntimeError(f"Claude declined the request (model {self.model})")
-        return "".join(b.text for b in response.content if b.type == "text")
+        ru = response.usage
+        usage = {
+            "input_tokens": getattr(ru, "input_tokens", None),
+            "output_tokens": getattr(ru, "output_tokens", None),
+            "cache_read_tokens": getattr(ru, "cache_read_input_tokens", None),
+            "cache_write_tokens": getattr(ru, "cache_creation_input_tokens", None),
+        }
+        return "".join(b.text for b in response.content if b.type == "text"), usage
 
     # -- Native Gemini API --------------------------------------------------
 
@@ -265,7 +300,7 @@ class LLMClient:
         messages: list[dict],
         temperature: float,
         max_tokens: int,
-    ) -> str:
+    ) -> tuple[str, dict]:
         """Call the native Gemini generateContent API.
 
         Used automatically when the OpenAI-compat endpoint returns 403,
@@ -307,7 +342,12 @@ class LLMClient:
         )
         resp.raise_for_status()
         data = resp.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        meta = data.get("usageMetadata") or {}
+        usage = {
+            "input_tokens": meta.get("promptTokenCount"),
+            "output_tokens": meta.get("candidatesTokenCount"),
+        }
+        return data["candidates"][0]["content"]["parts"][0]["text"], usage
 
     # -- OpenAI-compat API --------------------------------------------------
 
@@ -316,7 +356,7 @@ class LLMClient:
         messages: list[dict],
         temperature: float,
         max_tokens: int,
-    ) -> str:
+    ) -> tuple[str, dict]:
         """Call the OpenAI-compatible endpoint."""
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if self.api_key:
@@ -343,10 +383,15 @@ class LLMClient:
         return self._handle_compat_response(resp)
 
     @staticmethod
-    def _handle_compat_response(resp: httpx.Response) -> str:
+    def _handle_compat_response(resp: httpx.Response) -> tuple[str, dict]:
         resp.raise_for_status()
         data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        u = data.get("usage") or {}
+        usage = {
+            "input_tokens": u.get("prompt_tokens"),
+            "output_tokens": u.get("completion_tokens"),
+        }
+        return data["choices"][0]["message"]["content"], usage
 
     # -- public API ---------------------------------------------------------
 
@@ -356,7 +401,48 @@ class LLMClient:
         temperature: float = 0.0,
         max_tokens: int = 4096,
     ) -> str:
-        """Send a chat completion request and return the assistant message text."""
+        """Send a chat completion request and return the assistant message text.
+
+        Every call, successful or not, appends one ``llm_call`` record to the
+        structured run log (see :mod:`applypilot.telemetry`) with the model,
+        wall-clock duration, token counts and, where the provider reports it,
+        the dollar cost.
+        """
+        t0 = time.perf_counter()
+        input_chars = sum(len(m.get("content") or "") for m in messages)
+        try:
+            text, usage = self._chat_raw(messages, temperature, max_tokens)
+        except Exception as e:
+            telemetry.record(
+                "llm_call",
+                status="error",
+                provider=self.provider,
+                model=self.model,
+                input_chars=input_chars,
+                output_chars=0,
+                duration_ms=round((time.perf_counter() - t0) * 1000),
+                error=f"{type(e).__name__}: {str(e)[:300]}",
+            )
+            raise
+        telemetry.record(
+            "llm_call",
+            status="ok",
+            provider=self.provider,
+            model=self.model,
+            input_chars=input_chars,
+            output_chars=len(text or ""),
+            duration_ms=round((time.perf_counter() - t0) * 1000),
+            **{k: v for k, v in (usage or {}).items() if v is not None},
+        )
+        return text
+
+    def _chat_raw(
+        self,
+        messages: list[dict],
+        temperature: float,
+        max_tokens: int,
+    ) -> tuple[str, dict]:
+        """Provider dispatch. Returns (assistant text, usage dict)."""
         # Qwen3 optimization: prepend /no_think to skip chain-of-thought
         # reasoning, saving tokens on structured extraction tasks.
         if "qwen" in self.model.lower() and messages:
